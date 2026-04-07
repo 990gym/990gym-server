@@ -62,8 +62,10 @@ export default async function handler(req, res) {
 
     // 다음 결제일 오늘 기준 한달 후
     const nextDate = new Date();
-    nextDate.setMonth(nextDate.getMonth() + 1);
-    const nextBillingDate = nextDate.toISOString().split('T')[0];
+nextDate.setMonth(nextDate.getMonth() + 1);
+const kstOffset = 9 * 60;
+const kstDate = new Date(nextDate.getTime() + kstOffset * 60 * 1000);
+const nextBillingDate = kstDate.toISOString().split('T')[0];
 
     const { error: updateError } = await supabase
       .from('subscribers')
