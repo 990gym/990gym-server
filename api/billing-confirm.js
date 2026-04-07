@@ -5,6 +5,12 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
+const PLAN_PRICES = {
+  '베이직': 39000,
+  '스탠다드': 69000,
+  '프리미엄': 99000,
+};
+
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', 'https://the990.co.kr');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
@@ -19,6 +25,7 @@ export default async function handler(req, res) {
   }
 
   try {
+    // 1. 빌링키 발급
     const tossRes = await fetch('https://api.tosspayments.com/v1/billing/authorizations/issue', {
       method: 'POST',
       headers: {
@@ -29,13 +36,38 @@ export default async function handler(req, res) {
     });
 
     const tossData = await tossRes.json();
-
     if (!tossRes.ok) {
       return res.status(400).json({ error: tossData.message || '빌링키 발급 실패' });
     }
 
     const billingKey = tossData.billingKey;
 
+    // 2. 첫 결제 청구
+    const amount = PLAN_PRICES[plan] || 39000;
+    const orderId = 'order-' + Date.now();
+
+    const chargeRes = await fetch(`https://api.tosspayments.com/v1/billing/${billingKey}`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Basic ${Buffer.from(process.env.TOSS_SECRET_KEY + ':').toString('base64')}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        customerKey,
+        amount,
+        orderId,
+        orderName: `990짐 ${plan} 구독`,
+        customerEmail: email,
+        customerName: name,
+      }),
+    });
+
+    const chargeData = await chargeRes.json();
+    if (!chargeRes.ok) {
+      return res.status(400).json({ error: chargeData.message || '첫 결제 실패' });
+    }
+
+    // 3. DB 저장
     const { error: dbError } = await supabase.from('subscribers').insert({
       name,
       phone,
