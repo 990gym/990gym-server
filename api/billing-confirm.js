@@ -77,6 +77,7 @@ export default async function handler(req, res) {
       billing_key: billingKey,
       status: 'active',
       created_at: new Date().toISOString(),
+      next_billing_date: new Date(new Date().setMonth(new Date().getMonth() + 1)).toISOString().split('T')[0],
     });
 
     if (dbError) {
