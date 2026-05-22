@@ -68,7 +68,7 @@ export default async function handler(req, res) {
     }
 
     // 3. DB 저장
-    const { error: dbError } = await supabase.from('subscribers').insert({
+    const { error: dbError } = await supabase.from('subscribers').upsert({
       name,
       phone,
       email,
@@ -78,7 +78,7 @@ export default async function handler(req, res) {
       status: 'active',
       created_at: new Date().toISOString(),
       next_billing_date: new Date(new Date().setMonth(new Date().getMonth() + 1)).toISOString().split('T')[0],
-    });
+    }, { onConflict: 'name,phone' });
 
     if (dbError) {
       return res.status(500).json({ error: 'DB 저장 실패' });
