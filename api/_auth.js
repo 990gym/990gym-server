@@ -12,10 +12,16 @@ const HASH_KEY = 'admin_password_hash';
 // 예전에 페이지 소스에 공개돼 있던 비밀번호 — 다시 쓰지 못하게 막는다
 const LEAKED = ['990gym2026!'];
 
+// 요청마다 DB를 다시 읽지 않도록 잠깐(30초) 기억해 둔다
+let cache = { at: 0, hash: null };
+const CACHE_MS = 30 * 1000;
+
 async function storedHash(supabase) {
+  if (Date.now() - cache.at < CACHE_MS) return cache.hash;
   const { data, error } = await supabase.from('admin_settings').select('value').eq('key', HASH_KEY).maybeSingle();
-  if (error) return null; // 표가 아직 없으면 환경변수만 사용
-  return data ? data.value : null;
+  const hash = error ? null : (data ? data.value : null); // 표가 아직 없으면 환경변수만 사용
+  cache = { at: Date.now(), hash };
+  return hash;
 }
 
 // 지금 유효한 비밀번호 정보: { kind: 'db', hash } | { kind: 'env', pw } | null
@@ -93,6 +99,7 @@ export async function setPassword(supabase, next) {
   const { error } = await supabase.from('admin_settings')
     .upsert({ key: HASH_KEY, value: hashPassword(pw), updated_at: new Date().toISOString() });
   if (error) return '저장하지 못했어요. (Supabase에 admin_settings 표가 있는지 확인해주세요)';
+  cache = { at: 0, hash: null }; // 바로 다시 읽게
   return null;
 }
 

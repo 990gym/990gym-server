@@ -78,8 +78,12 @@ async function pulse(_, authed) {
 // ---------- 로그인해야 되는 것 ----------
 
 async function listSubscribers() {
-  const rows = await selectAll('subscribers', '*', [['created_at', false]]);
-  return [200, { subscribers: rows.map(hide) }];
+  // 구독 이력도 함께 보내서, 관리자 화면에서 이름을 누르면 바로 열리게 한다
+  const [rows, events] = await Promise.all([
+    selectAll('subscribers', '*', [['created_at', false]]),
+    selectAll('subscription_events', '*', [['occurred_at', true], ['id', true]]).catch(() => null),
+  ]);
+  return [200, { subscribers: rows.map(hide), events }];
 }
 
 async function inquiryCount() {
