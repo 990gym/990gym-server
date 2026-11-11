@@ -115,11 +115,10 @@ async function listEvents({ subscriberId }) {
 }
 
 async function statsData() {
-  const subs = await selectAll('subscribers', 'id,name,plan,status,created_at,cancelled_at,churn_reason', [['created_at', true]]);
-  let events = [];
-  try {
-    events = await selectAll('subscription_events', '*', [['occurred_at', true], ['id', true]]);
-  } catch (e) { /* 이력 표가 없으면 빈 칸 */ }
+  const [subs, events] = await Promise.all([
+    selectAll('subscribers', 'id,name,plan,status,created_at,cancelled_at,churn_reason', [['created_at', true]]),
+    selectAll('subscription_events', '*', [['occurred_at', true], ['id', true]]).catch(() => []), // 이력 표가 없으면 빈 칸
+  ]);
   return [200, { subscribers: subs, events }];
 }
 
