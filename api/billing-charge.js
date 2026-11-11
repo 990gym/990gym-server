@@ -19,6 +19,16 @@ export default async function handler(req, res) {
     if (error) throw error;
     const results = [];
     for (const sub of subscribers) {
+      // 첫 달 할인 손님: 정가 전환에 동의하지 않았으면 결제 없이 종료
+      if (sub.promo && !sub.price_consent_at) {
+        await supabase.from('subscribers').update({
+          status: 'cancelled',
+          cancelled_at: new Date().toISOString(),
+          churn_reason: '첫 달 체험 후 정가 전환 미동의',
+        }).eq('id', sub.id);
+        results.push({ id: sub.id, success: true, ended: 'promo_no_consent' });
+        continue;
+      }
       // 플랜 + 애드온 (플랜이 바뀌어 안 맞는 애드온은 자동으로 빠짐)
       const amount = monthlyAmount(sub.plan, sub.addons);
       if (!amount) continue;

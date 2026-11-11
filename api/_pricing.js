@@ -36,6 +36,29 @@ export function monthlyAmount(plan, addons) {
   return cleanAddons(plan, addons).reduce((sum, a) => sum + ADDONS[a].price, base);
 }
 
+// 첫 달 할인 프로모션 (처음 구독하는 사람만)
+// 둘째 달부터 정가로 오르는 건 전자상거래법상 '대금 증액'이라,
+// 결제일 전 30일 안에 손님이 동의 링크(continue.html)에서 직접 동의해야만 정가 결제가 된다.
+// 동의가 없으면 결제일에 결제 없이 자동 종료된다 (billing-charge.js).
+export const PROMOS = {
+  spinning_half: { plan: '프리미엄', firstAmount: 49500, label: '프리미엄 스피닝 첫 달 50%' },
+};
+
+export function getPromo(plan, promo) {
+  const p = PROMOS[promo];
+  return p && p.plan === plan ? p : null;
+}
+
+// 동의 받는 기간: 결제일 14일 전 ~ 결제일 당일
+// (법: 증액 전 30일 이내에 동의. 가입 직후와 확실히 떨어뜨리려고 14일 전부터 연다)
+export const CONSENT_OPEN_DAYS = 14;
+export function consentWindowOpen(nextBillingDate, now = new Date()) {
+  if (!nextBillingDate) return false;
+  const due = new Date(`${String(nextBillingDate).slice(0, 10)}T00:00:00+09:00`);
+  const opens = new Date(due.getTime() - CONSENT_OPEN_DAYS * 24 * 60 * 60 * 1000);
+  return now >= opens && now < new Date(due.getTime() + 24 * 60 * 60 * 1000);
+}
+
 // 토스 주문명 예: "990짐 베이직 월 구독 + 개인락커 + 운동복·수건"
 export function orderName(plan, addons, label = '월 구독') {
   const extras = cleanAddons(plan, addons).map((a) => ADDONS[a].name);

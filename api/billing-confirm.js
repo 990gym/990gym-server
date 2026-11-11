@@ -1,5 +1,5 @@
 import { createClient } from '@supabase/supabase-js';
-import { cleanAddons, monthlyAmount, orderName } from './_pricing.js';
+import { cleanAddons, monthlyAmount, orderName, getPromo } from './_pricing.js';
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -19,11 +19,28 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: '필수 정보가 누락되었습니다.' });
   }
 
-  // 금액은 서버가 정한다 (플랜 + 그 플랜에 허용된 애드온만)
-  const addons = cleanAddons(plan, req.body.addons);
-  const amount = monthlyAmount(plan, addons);
+  // 금액은 서버가 정한다 (플랜 + 그 플랜에 허용된 애드온만, 프로모션이면 첫 달 할인가)
+  const promoKey = req.body.promo && getPromo(plan, req.body.promo) ? req.body.promo : null;
+  const promo = promoKey ? getPromo(plan, promoKey) : null;
+  const addons = promo ? [] : cleanAddons(plan, req.body.addons);
+  const amount = promo ? promo.firstAmount : monthlyAmount(plan, addons);
   if (!amount) {
     return res.status(400).json({ error: '플랜 정보가 올바르지 않습니다.' });
+  }
+
+  // 첫 달 할인은 처음 구독하는 분만 (예전에 구독한 적 있는 번호는 불가)
+  if (promo) {
+    const digits = String(phone).replace(/\D/g, '');
+    const dashed = digits.replace(/^(\d{3})(\d{3,4})(\d{4})$/, '$1-$2-$3');
+    const { data: prev, error: prevError } = await supabase
+      .from('subscribers')
+      .select('id')
+      .in('phone', [phone, digits, dashed])
+      .limit(1);
+    if (prevError) return res.status(500).json({ error: '서버 오류' });
+    if (prev && prev.length) {
+      return res.status(400).json({ error: '첫 달 할인은 처음 구독하시는 분만 받을 수 있어요. 센터(02-371-2684)로 문의해주세요.' });
+    }
   }
 
   try {
@@ -57,7 +74,7 @@ export default async function handler(req, res) {
         customerKey,
         amount,
         orderId,
-        orderName: orderName(plan, addons, '구독'),
+        orderName: promo ? `990짐 ${promo.label}` : orderName(plan, addons, '구독'),
         customerEmail: email,
         customerName: name,
       }),
@@ -75,6 +92,8 @@ export default async function handler(req, res) {
       email,
       plan,
       addons,
+      promo: promoKey,
+      price_consent_at: null,
       customer_key: customerKey,
       billing_key: billingKey,
       status: 'active',
@@ -86,7 +105,7 @@ export default async function handler(req, res) {
       return res.status(500).json({ error: 'DB 저장 실패' });
     }
 
-    return res.status(200).json({ success: true, billingKey, amount, addons });
+    return res.status(200).json({ success: true, billingKey, amount, addons, promo: promoKey });
   } catch (err) {
     return res.status(500).json({ error: '서버 오류' });
   }
