@@ -1,6 +1,6 @@
 import { createClient } from '@supabase/supabase-js';
 import { PLAN_PRICES, cleanAddons, monthlyAmount, orderName } from './_pricing.js';
-import { cors, bearer, checkPassword, issueToken, verifyToken, passwordConfigured } from './_auth.js';
+import { cors, bearer, checkPassword, issueToken, verifyToken, passwordConfigured, setPassword } from './_auth.js';
 
 // 관리자 페이지(admin · inquiry · stats)의 모든 데이터 작업은 여기를 거친다.
 // POST { action, ...params }  /  Authorization: Bearer <로그인 토큰>
@@ -46,13 +46,15 @@ async function getSub(id) {
 
 // ---------- 로그인 없이 되는 것 ----------
 
+const slow = () => new Promise((r) => setTimeout(r, 800)); // 비밀번호 마구 넣어보기 늦추기
+
 async function login({ password }) {
-  if (!passwordConfigured()) return [500, { error: '서버에 관리자 비밀번호(ADMIN_PASSWORD)가 아직 설정되지 않았어요.' }];
-  if (!checkPassword(password)) {
-    await new Promise((r) => setTimeout(r, 800)); // 비밀번호 마구 넣어보기 늦추기
+  if (!(await passwordConfigured(supabase))) return [500, { error: '서버에 관리자 비밀번호(ADMIN_PASSWORD)가 아직 설정되지 않았어요.' }];
+  if (!(await checkPassword(supabase, password))) {
+    await slow();
     return [401, { error: '비밀번호가 올바르지 않습니다.' }];
   }
-  return [200, issueToken()];
+  return [200, await issueToken(supabase)];
 }
 
 // 알림용 맥박: 관리자 화면을 켜 두기만 해도(로그아웃 상태여도) 새 가입·할 일을 알 수 있게.
@@ -115,6 +117,18 @@ async function statsData() {
     events = await selectAll('subscription_events', '*', [['occurred_at', true], ['id', true]]);
   } catch (e) { /* 이력 표가 없으면 빈 칸 */ }
   return [200, { subscribers: subs, events }];
+}
+
+// 관리자 비밀번호 변경 (지금 비밀번호 확인 후). 바뀌면 다른 컴퓨터의 로그인은 모두 풀린다.
+async function changePassword({ current, next }) {
+  if (!(await checkPassword(supabase, current))) {
+    await slow();
+    return [400, { error: '지금 비밀번호가 맞지 않아요.' }];
+  }
+  if (String(next) === String(current)) return [400, { error: '지금과 다른 비밀번호로 해주세요.' }];
+  const problem = await setPassword(supabase, next);
+  if (problem) return [400, { error: problem }];
+  return [200, { success: true, ...(await issueToken(supabase)) }];
 }
 
 // 고칠 수 있는 칸만 받는다
@@ -211,7 +225,7 @@ async function setStatus({ id, status, churn_reason }) {
 const PUBLIC = { login, pulse };
 const PRIVATE = {
   listSubscribers, inquiryCount, listInquiries, setInquiryContacted,
-  listEvents, statsData, updateSubscriber, setStatus,
+  listEvents, statsData, updateSubscriber, setStatus, changePassword,
 };
 
 export default async function handler(req, res) {
@@ -221,7 +235,7 @@ export default async function handler(req, res) {
 
   const params = req.body || {};
   const { action } = params;
-  const authed = verifyToken(bearer(req));
+  const authed = await verifyToken(supabase, bearer(req));
   const fn = PUBLIC[action] || PRIVATE[action];
   if (!fn) return res.status(400).json({ error: '알 수 없는 요청' });
   if (PRIVATE[action] && !authed) return res.status(401).json({ error: '로그인이 필요해요' });
