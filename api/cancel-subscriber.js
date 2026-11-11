@@ -1,11 +1,10 @@
 import { createClient } from '@supabase/supabase-js';
+import { monthlyAmount, orderName } from './_pricing.js';
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
-
-const PLAN_PRICES = { '베이직': 39000, '스탠다드': 69000, '프리미엄': 99000 };
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -37,7 +36,7 @@ export default async function handler(req, res) {
 
     if (fetchError || !sub) return res.status(404).json({ error: '회원 없음' });
 
-    const amount = PLAN_PRICES[sub.plan];
+    const amount = monthlyAmount(sub.plan, sub.addons);
     if (!amount) return res.status(400).json({ error: '플랜 오류' });
 
     // 즉시 결제
@@ -51,7 +50,7 @@ export default async function handler(req, res) {
         customerKey: sub.customer_key,
         amount,
         orderId: `order-restore-${sub.id}-${Date.now()}`,
-        orderName: `990짐 ${sub.plan} 월 구독`,
+        orderName: orderName(sub.plan, sub.addons),
         customerEmail: sub.email,
         customerName: sub.name,
       }),

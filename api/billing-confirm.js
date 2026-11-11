@@ -1,15 +1,10 @@
 import { createClient } from '@supabase/supabase-js';
+import { cleanAddons, monthlyAmount, orderName } from './_pricing.js';
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
-
-const PLAN_PRICES = {
-  '베이직': 39000,
-  '스탠다드': 69000,
-  '프리미엄': 99000,
-};
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', 'https://the990.co.kr');
@@ -22,6 +17,13 @@ export default async function handler(req, res) {
 
   if (!authKey || !customerKey || !name || !phone || !email || !plan) {
     return res.status(400).json({ error: '필수 정보가 누락되었습니다.' });
+  }
+
+  // 금액은 서버가 정한다 (플랜 + 그 플랜에 허용된 애드온만)
+  const addons = cleanAddons(plan, req.body.addons);
+  const amount = monthlyAmount(plan, addons);
+  if (!amount) {
+    return res.status(400).json({ error: '플랜 정보가 올바르지 않습니다.' });
   }
 
   try {
@@ -43,7 +45,6 @@ export default async function handler(req, res) {
     const billingKey = tossData.billingKey;
 
     // 2. 첫 결제 청구
-    const amount = PLAN_PRICES[plan] || 39000;
     const orderId = 'order-' + Date.now();
 
     const chargeRes = await fetch(`https://api.tosspayments.com/v1/billing/${billingKey}`, {
@@ -56,7 +57,7 @@ export default async function handler(req, res) {
         customerKey,
         amount,
         orderId,
-        orderName: `990짐 ${plan} 구독`,
+        orderName: orderName(plan, addons, '구독'),
         customerEmail: email,
         customerName: name,
       }),
@@ -73,6 +74,7 @@ export default async function handler(req, res) {
       phone,
       email,
       plan,
+      addons,
       customer_key: customerKey,
       billing_key: billingKey,
       status: 'active',
@@ -84,7 +86,7 @@ export default async function handler(req, res) {
       return res.status(500).json({ error: 'DB 저장 실패' });
     }
 
-    return res.status(200).json({ success: true, billingKey });
+    return res.status(200).json({ success: true, billingKey, amount, addons });
   } catch (err) {
     return res.status(500).json({ error: '서버 오류' });
   }

@@ -1,9 +1,9 @@
 import { createClient } from '@supabase/supabase-js';
+import { monthlyAmount, orderName } from './_pricing.js';
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
-const PLAN_PRICES = { '베이직': 39000, '스탠다드': 69000, '프리미엄': 99000 };
 
 export default async function handler(req, res) {
   if (req.headers['authorization'] !== `Bearer ${process.env.CRON_SECRET}`) {
@@ -19,7 +19,8 @@ export default async function handler(req, res) {
     if (error) throw error;
     const results = [];
     for (const sub of subscribers) {
-      const amount = PLAN_PRICES[sub.plan];
+      // 플랜 + 애드온 (플랜이 바뀌어 안 맞는 애드온은 자동으로 빠짐)
+      const amount = monthlyAmount(sub.plan, sub.addons);
       if (!amount) continue;
       try {
         const tossRes = await fetch('https://api.tosspayments.com/v1/billing/' + sub.billing_key, {
@@ -32,7 +33,7 @@ export default async function handler(req, res) {
             customerKey: sub.customer_key,
             amount,
             orderId: `order-${sub.id}-${Date.now()}`,
-            orderName: `990짐 ${sub.plan} 월 구독`,
+            orderName: orderName(sub.plan, sub.addons),
             customerEmail: sub.email,
             customerName: sub.name,
           }),
