@@ -49,9 +49,9 @@ export function getPromo(plan, promo) {
   return p && p.plan === plan ? p : null;
 }
 
-// 동의 받는 기간: 결제일 14일 전 ~ 결제일 당일
-// (법: 증액 전 30일 이내에 동의. 가입 직후와 확실히 떨어뜨리려고 14일 전부터 연다)
-export const CONSENT_OPEN_DAYS = 14;
+// 동의 받는 기간: 결제일 10일 전 ~ 결제일 당일 (손님에겐 "결제일 1주 전까지 문자 안내")
+// (법: 증액 전 30일 이내에 동의. 가입 직후와 확실히 떨어뜨리려고 10일 전부터 연다)
+export const CONSENT_OPEN_DAYS = 10;
 export function consentWindowOpen(nextBillingDate, now = new Date()) {
   if (!nextBillingDate) return false;
   const due = new Date(`${String(nextBillingDate).slice(0, 10)}T00:00:00+09:00`);

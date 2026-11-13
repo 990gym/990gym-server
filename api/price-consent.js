@@ -54,7 +54,7 @@ export default async function handler(req, res) {
   const v = view(sub);
   if (v.consented) return res.status(200).json({ success: true, ...v });
   if (sub.status !== 'active') return res.status(400).json({ error: '이미 종료된 구독이에요. 센터로 문의해주세요.' });
-  if (!v.canConsent) return res.status(400).json({ error: '아직 안내 기간이 아니에요. 결제일 2주 전부터 가능해요.' });
+  if (!v.canConsent) return res.status(400).json({ error: '아직 안내 기간이 아니에요. 결제일 10일 전부터 가능해요.' });
 
   const now = new Date().toISOString();
   const { error: upError } = await supabase
