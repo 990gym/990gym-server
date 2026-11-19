@@ -116,7 +116,7 @@ async function listEvents({ subscriberId }) {
 
 async function statsData() {
   const [subs, events] = await Promise.all([
-    selectAll('subscribers', 'id,name,plan,status,created_at,cancelled_at,churn_reason', [['created_at', true]]),
+    selectAll('subscribers', 'id,name,plan,status,created_at,cancelled_at,churn_reason,paused_at', [['created_at', true]]),
     selectAll('subscription_events', '*', [['occurred_at', true], ['id', true]]).catch(() => []), // 이력 표가 없으면 빈 칸
   ]);
   return [200, { subscribers: subs, events }];
@@ -162,8 +162,46 @@ async function updateSubscriber({ id, fields }) {
   if (fields.consent_msg_sent) {
     patch.consent_msg_sent_at = new Date().toISOString();
   }
+  if (fields.resume_msg_sent) {
+    patch.resume_msg_sent_at = new Date().toISOString();
+  }
   if (!Object.keys(patch).length) return [400, { error: '바꿀 내용이 없어요' }];
 
+  const { error } = await supabase.from('subscribers').update(patch).eq('id', id);
+  if (error) throw error;
+  return [200, { success: true, subscriber: hide({ ...sub, ...patch }) }];
+}
+
+// 쉬어가기: 다음 결제를 미루고 그동안 결제 없이 쉰다. 재시작일에 자동결제로 다시 시작(billing-charge.js).
+// 재시작일은 원래 결제일 기준 7일 뒤 ~ 90일 뒤. 쉬는 중에 다시 부르면 재시작일만 바꾼다.
+const PAUSE_MIN_DAYS = 7;
+const PAUSE_MAX_DAYS = 90;
+const addDaysYmd = (ymd, n) => {
+  const d = new Date(`${ymd}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+};
+
+async function pauseSubscriber({ id, resumeDate }) {
+  if (!id || !resumeDate) return [400, { error: '필수 정보 누락' }];
+  const d = String(resumeDate);
+  if (!DATE_RE.test(d) || Number.isNaN(Date.parse(d))) return [400, { error: '날짜 형식 오류' }];
+  const sub = await getSub(id);
+  if (!sub) return [404, { error: '회원 없음' }];
+  if (sub.promo && !sub.price_consent_at) return [400, { error: '스피닝 첫 달 회원은 정가 동의 후에 쉬어가기를 쓸 수 있어요.' }];
+  if (sub.status !== 'active' && sub.status !== 'paused') return [400, { error: '구독 중인 회원만 쉬어갈 수 있어요.' }];
+  const base = String((sub.status === 'paused' ? sub.pause_from_date : null) || sub.next_billing_date || '').slice(0, 10);
+  if (!DATE_RE.test(base)) return [400, { error: '원래 결제일이 없어서 쉬어가기를 할 수 없어요.' }];
+  const min = addDaysYmd(base, PAUSE_MIN_DAYS);
+  const max = addDaysYmd(base, PAUSE_MAX_DAYS);
+  if (d < min || d > max) return [400, { error: `재시작일은 ${min} ~ ${max} 사이로 골라주세요.` }];
+
+  const patch = { next_billing_date: d, resume_msg_sent_at: null };
+  if (sub.status === 'active') {
+    patch.status = 'paused';
+    patch.paused_at = new Date().toISOString();
+    patch.pause_from_date = base;
+  }
   const { error } = await supabase.from('subscribers').update(patch).eq('id', id);
   if (error) throw error;
   return [200, { success: true, subscriber: hide({ ...sub, ...patch }) }];
@@ -212,6 +250,9 @@ async function setStatus({ id, status, churn_reason }) {
       next_billing_date: kstDatePlusMonth(),
       churn_reason: null,
       cancelled_at: null,
+      paused_at: null,
+      pause_from_date: null,
+      resume_msg_sent_at: null,
     };
     // 첫 달 할인 손님을 정가로 바로 결제해 복구했다면, 정가 이용을 원한 것이므로
     // 다음 달에 '동의 없음'으로 다시 자동 종료되지 않게 한다.
@@ -228,7 +269,7 @@ async function setStatus({ id, status, churn_reason }) {
 const PUBLIC = { login, pulse };
 const PRIVATE = {
   listSubscribers, inquiryCount, listInquiries, setInquiryContacted,
-  listEvents, statsData, updateSubscriber, setStatus, changePassword,
+  listEvents, statsData, updateSubscriber, setStatus, changePassword, pauseSubscriber,
 };
 
 export default async function handler(req, res) {

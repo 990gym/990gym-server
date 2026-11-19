@@ -14,13 +14,13 @@ export default async function handler(req, res) {
     const { data: subscribers, error } = await supabase
       .from('subscribers')
       .select('*')
-      .eq('status', 'active')
+      .in('status', ['active', 'paused'])   // paused = 쉬어가기 끝나고 오늘 다시 시작
       .eq('next_billing_date', today);
     if (error) throw error;
     const results = [];
     for (const sub of subscribers) {
       // 첫 달 할인 손님: 정가 전환에 동의하지 않았으면 결제 없이 종료
-      if (sub.promo && !sub.price_consent_at) {
+      if (sub.status === 'active' && sub.promo && !sub.price_consent_at) {
         await supabase.from('subscribers').update({
           status: 'cancelled',
           cancelled_at: new Date().toISOString(),
@@ -53,9 +53,9 @@ export default async function handler(req, res) {
           // 다음 결제일 한 달 후로 업데이트
           const nextDate = new Date(today);
           nextDate.setMonth(nextDate.getMonth() + 1);
-          await supabase.from('subscribers').update({
-            next_billing_date: nextDate.toISOString().split('T')[0]
-          }).eq('id', sub.id);
+          const patch = { next_billing_date: nextDate.toISOString().split('T')[0] };
+          if (sub.status === 'paused') Object.assign(patch, { status: 'active', paused_at: null, pause_from_date: null, resume_msg_sent_at: null });
+          await supabase.from('subscribers').update(patch).eq('id', sub.id);
           results.push({ id: sub.id, success: true });
         } else {
           await supabase.from('subscribers').update({ status: 'payment_failed' }).eq('id', sub.id);
