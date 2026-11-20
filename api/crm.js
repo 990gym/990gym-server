@@ -710,6 +710,40 @@ async function reportV2({ ym, week }) {
   }];
 }
 
+// ---------- 출석부 (하루 입장 순서) ----------
+async function attendanceDay({ date }) {
+  const today = todayKST();
+  const d = /^\d{4}-\d{2}-\d{2}$/.test(String(date || '')) && date <= today ? date : today;
+  const rows = await selectAll(() => supabase.from('crm_attendance').select('member_id,checked_at').gte('checked_at', kstStart(d)).lt('checked_at', kstEndEx(d)).order('checked_at', { ascending: true }));
+  const ids = [...new Set(rows.map((r) => r.member_id))];
+  const chunks = []; for (let i = 0; i < ids.length; i += 150) chunks.push(ids.slice(i, i + 150));
+  const monthStart = kstStart(`${d.slice(0, 7)}-01`);
+  const [mres, pres, ares, subs, trial] = await Promise.all([
+    Promise.all(chunks.map((c) => supabase.from('crm_members').select(MEMBER_COLS).in('id', c))),
+    Promise.all(chunks.map((c) => supabase.from('crm_passes').select('member_id,product_name,category,ends_on').in('member_id', c).in('status', ['사용 중', '예정', '홀딩']))),
+    Promise.all(chunks.map((c) => selectAll(() => supabase.from('crm_attendance').select('member_id,checked_at').in('member_id', c).gte('checked_at', monthStart).lt('checked_at', kstEndEx(d))))),
+    subsMap(), trialOnlySet(),
+  ]);
+  const mem = {}, pass = {}, pt = {}, monthN = {};
+  mres.forEach(({ data, error }) => { if (error) throw error; markTrial(data.map((m) => decorate(m, today, subs)), trial).forEach((m) => { mem[m.id] = m; }); });
+  pres.forEach(({ data, error }) => { if (error) throw error; data.forEach((p) => { if (salesGroup(p.product_name, p.category) === 'PT') { pt[p.member_id] = p.product_name; return; } if (!pass[p.member_id] || String(p.ends_on) > String(pass[p.member_id].ends_on)) pass[p.member_id] = p; }); });
+  ares.forEach((l) => l.forEach((a) => { monthN[a.member_id] = (monthN[a.member_id] || 0) + 1; }));
+  // 한 사람이 여러 번 찍으면 처음 입장 기준 한 줄 + 횟수
+  const seen = {}, list = [];
+  rows.forEach((r) => {
+    const t = new Date(Date.parse(r.checked_at) + 9 * 3600e3).toISOString().slice(11, 16);
+    if (seen[r.member_id]) { seen[r.member_id].times.push(t); seen[r.member_id].last_at = r.checked_at; return; }
+    const m = mem[r.member_id] || {};
+    const row = { member_id: r.member_id, name: m.name || '-', stage: m.stage || null, sub: m.sub || null, holding: !!m.holding, days_left: m.days_left ?? null, next_billing: m.next_billing || null,
+      pass: pass[r.member_id] ? pass[r.member_id].product_name : (m.usage_tag || null), pt: pt[r.member_id] || null, times: [t], first_at: r.checked_at, last_at: r.checked_at, month: monthN[r.member_id] || 1 };
+    seen[r.member_id] = row; list.push(row);
+  });
+  const nowMs = Date.now();
+  list.forEach((x, i) => { x.no = i + 1; x.in_gym = d === today && nowMs - Date.parse(x.last_at) < 2 * 3600e3; });
+  const hours = Array(24).fill(0); rows.forEach((r) => hours[kstHour(r.checked_at)]++);
+  return [200, { date: d, today, total: rows.length, people: list.length, now: list.filter((x) => x.in_gym).length, hours, list }];
+}
+
 // ---------- 자동 문자 규칙 (발송 업체 연결 전: 켜고 끄기와 대상 수만) ----------
 const MSG_RULES = [
   { key: 'inq_price', stage: '유입', type: '자동 발송', title: '문의 즉시 가격 안내', body: '{이름}님, 990짐에 문의 주셔서 감사해요. 가격표와 시설 사진 → {링크}' },
@@ -1467,7 +1501,7 @@ async function photoUpload({ id, image }) {
 }
 
 const ACTIONS = { dashboard, members, member, lockerBoard, kioskRegister, checkinFind, checkin, photoUpload,
-  taskDone, taskUndo, staffList, staffAdd, staffRemove, financeGet, financeSave, salesYear, subSearch, subLink, staffUpdate, rolesSave, report, memoAdd, inquiryAdd, inquiryList, inquiryUpdate, ptBoard, revenue, msgRules, msgRulesSave, ptSession, ptAssign, ptSetLeft, notionSync, passUpdate, paymentMethod, staffOrder, roleColor, taskSnooze, reportV2 };
+  taskDone, taskUndo, staffList, staffAdd, staffRemove, financeGet, financeSave, salesYear, subSearch, subLink, staffUpdate, rolesSave, report, memoAdd, inquiryAdd, inquiryList, inquiryUpdate, ptBoard, revenue, msgRules, msgRulesSave, ptSession, ptAssign, ptSetLeft, notionSync, passUpdate, paymentMethod, staffOrder, roleColor, taskSnooze, reportV2, attendanceDay };
 const KIOSK_OK = ['checkinFind', 'checkin', 'photoUpload'];
 const WRITES = ['checkin', 'photoUpload', 'taskDone', 'taskUndo', 'staffAdd', 'staffUpdate', 'staffRemove', 'financeSave', 'subLink', 'rolesSave', 'memoAdd', 'inquiryAdd', 'inquiryUpdate', 'msgRulesSave', 'ptSession', 'ptAssign', 'ptSetLeft', 'notionSync', 'passUpdate', 'paymentMethod', 'staffOrder', 'roleColor', 'taskSnooze'];
 
