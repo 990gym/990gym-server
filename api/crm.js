@@ -1018,35 +1018,40 @@ async function report({ period = 'month' }) {
   // ── 시안 보고서용 ──
   // 깔때기: 유입(문의) → 체험(체험권 결제) → 정규 등록(신규 결제) → 재등록
   const inP = (d) => d >= P.from && d <= P.to;
-  const trialM = new Set(), regM = new Set(), regDay = {}, regSub = {};
+  const trialM = new Set(), newPay = new Set(), regDay = {};
   const passById = Object.fromEntries(passes.map((x) => [x.id, x]));
   pays.filter((p) => inP(p.day)).forEach((p) => {
     const nm = (passById[p.pass_id] || {}).product_name || '';
     if (/체험|^PT ?3회$/.test(nm)) trialM.add(p.member_id);
-    else if (p.kind === '신규' && p.group !== 'PT') { // 정규 등록 = 회원권(헬스·GX·월구독) 신규. PT만 산 건 PT 화면에서 본다
-      regM.add(p.member_id);
-      if (!regDay[p.member_id] || p.day < regDay[p.member_id]) { regDay[p.member_id] = p.day; regSub[p.member_id] = p.group === '월구독'; }
-    }
+    else if (p.kind === '신규') { newPay.add(p.member_id); if (!regDay[p.member_id] || p.day < regDay[p.member_id]) regDay[p.member_id] = p.day; }
   });
-  // 정규 등록한 사람이 어디서 왔나: 이 기간 문의 / 그 전 문의 / 문의 기록 없음(홈페이지 월구독 가입 따로)
-  const regIds = [...regM];
-  const [allInq, regPeople] = await Promise.all([
-    selectAll(() => supabase.from('crm_inquiries').select('member_id,phone,inquired_at').or(INQ_OK)),
-    regIds.length ? supabase.from('crm_members').select('id,phone').in('id', regIds) : Promise.resolve({ data: [] }),
+  // 정규 등록 = 처음 오신 분 (PT만 사도 포함). 브로제이가 '신규'로 찍었어도 이 기간 전에 이용권이 있던 분은 '복귀'로 따로 센다
+  const cand = [...newPay];
+  const chunks = []; for (let i = 0; i < cand.length; i += 150) chunks.push(cand.slice(i, i + 150));
+  const [priorRes, peopleRes, allInq] = await Promise.all([
+    Promise.all(chunks.map((c) => supabase.from('crm_passes').select('member_id').in('member_id', c).lt('registered_on', P.from).neq('status', '무효'))),
+    Promise.all(chunks.map((c) => supabase.from('crm_members').select('id,name,phone').in('id', c))),
+    selectAll(() => supabase.from('crm_inquiries').select('member_id,name,phone,inquired_at').or(INQ_OK)),
   ]);
-  const phoneOf = Object.fromEntries((regPeople.data || []).map((m) => [m.id, m.phone]));
-  const origin = { thisPeriod: 0, earlier: 0, online: 0, none: 0 }, lag = [];
+  const prior = new Set(), person = {};
+  priorRes.forEach(({ data, error }) => { if (error) throw error; data.forEach((x) => prior.add(x.member_id)); });
+  peopleRes.forEach(({ data, error }) => { if (error) throw error; data.forEach((x) => { person[x.id] = x; }); });
+  const regIds = cand.filter((m) => !prior.has(m)), returned = cand.length - regIds.length;
+  const regM = new Set(regIds);
+  const bare = (v) => String(v || '').replace(/\(.*?\)|\s/g, '');
+  const origin = { thisPeriod: 0, earlier: 0, none: 0 }, lag = [];
   regIds.forEach((mid) => {
-    const ph = phoneOf[mid], rd = regDay[mid];
-    const qs = allInq.filter((q) => (q.member_id === mid || (ph && q.phone === ph)) && kstDate(q.inquired_at) <= new Date(Date.parse(rd) + DAY).toISOString().slice(0, 10)).map((q) => kstDate(q.inquired_at)).sort();
-    const last = qs[qs.length - 1];
+    const m = person[mid] || {}, rd = regDay[mid], until = new Date(Date.parse(rd) + DAY).toISOString().slice(0, 10), since = new Date(Date.parse(rd) - 180 * DAY).toISOString().slice(0, 10);
+    // 연락처·회원 연결이 먼저, 없으면 같은 이름 (반년 안 문의만)
+    let qs = allInq.filter((q) => (q.member_id === mid || (m.phone && q.phone === m.phone)) && kstDate(q.inquired_at) <= until);
+    if (!qs.length && m.name) qs = allInq.filter((q) => bare(q.name) === bare(m.name) && kstDate(q.inquired_at) <= until && kstDate(q.inquired_at) >= since);
+    const last = qs.map((q) => kstDate(q.inquired_at)).sort().pop();
     if (last && last >= P.from) origin.thisPeriod++;
     else if (last) { origin.earlier++; lag.push(daysBetween(last, rd)); }
-    else if (regSub[mid]) origin.online++;
     else origin.none++;
   });
   const funnel = { inquiries: inqAll.data.length, trial: trialM.size, regular: regM.size, regularFromTrial: regIds.filter((m) => trialM.has(m)).length, renewed: cur.renewed, ended: cur.ended,
-    origin, earlierLag: lag.length ? Math.round(lag.reduce((a, b) => a + b, 0) / lag.length) : null };
+    origin, returned, earlierLag: lag.length ? Math.round(lag.reduce((a, b) => a + b, 0) / lag.length) : null };
   // 유입 경로별 문의 수 · 등록 비율
   const src = {};
   inqAll.data.forEach((q) => { const k = q.source || '기록 없음'; const o = (src[k] = src[k] || { source: k, count: 0, joined: 0 }); o.count++; if (q.result === '등록' || q.member_id) o.joined++; });
@@ -1149,19 +1154,21 @@ async function members({ q = '', stage = '', limit = 60, offset = 0, sort = '', 
   const ids = rows.map((m) => m.id);
   const monthStart = new Date(Date.parse(`${today.slice(0, 7)}-01T00:00:00+09:00`)).toISOString();
   const chunks = []; for (let i = 0; i < ids.length; i += 150) chunks.push(ids.slice(i, i + 150));
-  const [ps, at] = await Promise.all([
+  const [ps, at, firsts] = await Promise.all([
     Promise.all(chunks.map((c) => supabase.from('crm_passes').select('member_id,product_name,category,ends_on,registered_on').in('member_id', c).in('status', ['사용 중', '예정', '홀딩']))),
     Promise.all(chunks.map((c) => selectAll(() => supabase.from('crm_attendance').select('member_id').in('member_id', c).gte('checked_at', monthStart)))),
+    // 처음 등록한 날 = 문의에서 회원으로 전환된 날 (나중에 PT를 사도 안 바뀜)
+    Promise.all(chunks.map((c) => selectAll(() => supabase.from('crm_passes').select('member_id,registered_on').in('member_id', c).neq('status', '무효')))),
   ]);
   const passName = {}, ptName = {}, visits = {}, regOn = {};
+  firsts.forEach((d) => d.forEach((p) => { if (p.registered_on && p.registered_on <= today && (!regOn[p.member_id] || p.registered_on < regOn[p.member_id])) regOn[p.member_id] = p.registered_on; }));
   ps.forEach(({ data: d, error: e }) => { if (e) throw e; d.forEach((p) => {
-    if (p.registered_on && p.registered_on <= today && (!regOn[p.member_id] || p.registered_on > regOn[p.member_id])) regOn[p.member_id] = p.registered_on;
     const g = salesGroup(p.product_name, p.category);
     if (g === 'PT') { ptName[p.member_id] = p.product_name; return; }
     if (!passName[p.member_id] || String(p.ends_on) > String(passName[p.member_id].ends_on)) passName[p.member_id] = p;
   }); });
   at.forEach((d) => d.forEach((a) => { visits[a.member_id] = (visits[a.member_id] || 0) + 1; }));
-  let out = rows.map((m) => ({ ...m, pass_name: passName[m.id] ? passName[m.id].product_name : null, pt_name: ptName[m.id] || null, month_visits: visits[m.id] || 0, registered_on: regOn[m.id] || m.first_started_on || null }));
+  let out = rows.map((m) => ({ ...m, pass_name: passName[m.id] ? passName[m.id].product_name : null, pt_name: ptName[m.id] || null, month_visits: visits[m.id] || 0, registered_on: [regOn[m.id], m.first_started_on].filter(Boolean).sort()[0] || null }));
   const STAGE_ORDER = ['체험·신규', '정착', '미출석', '만료 예정', '만료·이탈'];
   const val = (m) => key === 'reg' ? m.registered_on : key === 'name' ? m.name : key === 'status' ? (m.holding ? 9 : STAGE_ORDER.indexOf(m.stage)) : key === 'pass' ? (m.pass_name || m.usage_tag || '') : key === 'left' ? (m.sub === '구독 중' || m.sub === '쉬어가기' ? 9999 : m.days_left) : key === 'visits' ? m.month_visits : m.days_absent;
   out.sort((a, b) => {
