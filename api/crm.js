@@ -13,18 +13,44 @@ const DAY = 24 * 60 * 60 * 1000;
 const todayKST = () => new Date(Date.now() + 9 * 60 * 60 * 1000).toISOString().slice(0, 10);
 const daysBetween = (a, b) => Math.round((Date.parse(b) - Date.parse(a)) / DAY); // b - a
 
-// 홈페이지 월구독 (subscribers) — 전화번호 숫자로 회원과 맞춘다
+// 홈페이지 월구독 (subscribers) ↔ 회원 맞추기
+// 순서: ① 회원에 직접 연결해 둔 구독(가족 결제 등) ② 번호+이름 같음 ③ 이름만 같음(한 명일 때) ④ 번호만 같고 결제 중인 구독
+// 하나도 없으면 브로제이 구독 이용권으로 본다 (자동결제라 만료로 안 셈)
+const digitsOf = (p) => String(p || '').replace(/\D/g, '');
 async function subsMap() {
-  const { data, error } = await supabase.from('subscribers').select('phone,plan,status,next_billing_date,cancelled_at,paused_at,created_at').order('created_at', { ascending: true });
-  if (error) throw error;
-  const map = {};
-  (data || []).forEach((r) => { const k = String(r.phone || '').replace(/\D/g, ''); if (k) map[k] = r; }); // 같은 번호면 최근 가입 것
-  return map;
+  const [subs, bj] = await Promise.all([
+    supabase.from('subscribers').select('id,name,phone,plan,status,next_billing_date,cancelled_at,paused_at,created_at').order('created_at', { ascending: true }),
+    selectAll(() => supabase.from('crm_passes').select('member_id').in('status', ['사용 중', '예정', '홀딩']).ilike('product_name', '%구독%')),
+  ]);
+  if (subs.error) throw subs.error;
+  const S = { byId: {}, byPN: {}, byName: {}, byPhone: {}, bj: new Set(bj.map((r) => r.member_id)) };
+  (subs.data || []).forEach((r) => {
+    const p = digitsOf(r.phone), n = String(r.name || '').trim();
+    S.byId[r.id] = r;
+    if (p && n) S.byPN[`${p}|${n}`] = r;
+    if (n) (S.byName[n] = S.byName[n] || []).push(r);
+    if (p) S.byPhone[p] = r; // 같은 번호면 최근 가입 것
+  });
+  return S;
 }
-const subOf = (m, subs) => (subs && m.phone ? subs[String(m.phone).replace(/\D/g, '')] || null : null);
+function subOf(m, S) {
+  if (!S) return null;
+  if (m.subscriber_id && S.byId[m.subscriber_id]) return S.byId[m.subscriber_id];
+  const p = digitsOf(m.phone), n = String(m.name || '').trim();
+  if (p && S.byPN[`${p}|${n}`]) return S.byPN[`${p}|${n}`];
+  const byN = S.byName[n];
+  if (byN && byN.length === 1) return byN[0];
+  const byP = p && S.byPhone[p];
+  if (byP && ['active', 'payment_failed'].includes(byP.status)) return byP;
+  return null;
+}
 // 월구독 상태: 자동결제 중이면 만료 계산을 안 하고, 해지 신청·결제 실패만 끝나는 날을 본다
-function subState(sub, today) {
-  if (!sub) return null;
+function subState(sub, today, m, S) {
+  if (!sub) {
+    // 홈페이지 구독과 못 맞춘 브로제이 구독 이용권: 자동결제로 보고, 이용권이 끝난 지 10일 넘으면 만료로 본다
+    if (m && S && S.bj.has(m.id) && (!m.ends_on || daysBetween(m.ends_on, today) <= 10)) return { kind: '구독 중', next: m.ends_on, unlinked: true };
+    return null;
+  }
   if (sub.status === 'active') return { kind: sub.paused_at ? '쉬어가기' : '구독 중', next: sub.next_billing_date };
   if (sub.status === 'payment_failed') return { kind: '결제 실패', end: sub.next_billing_date };
   if (sub.status === 'cancelled') return { kind: '해지 신청', end: sub.next_billing_date };
@@ -52,7 +78,7 @@ function liveStage(m, today, ss) {
   return '정착';
 }
 
-const MEMBER_COLS = 'id,name,phone,gender,usage_tag,stage,holding,first_started_on,ends_on,last_attended_on,total_visits,lifetime_paid,counselor,trainer,source,marketing_consent,memo';
+const MEMBER_COLS = 'id,name,phone,gender,usage_tag,stage,holding,first_started_on,ends_on,last_attended_on,total_visits,lifetime_paid,counselor,trainer,source,marketing_consent,memo,subscriber_id';
 
 async function selectAll(build) {
   const rows = [];
@@ -65,7 +91,7 @@ async function selectAll(build) {
 }
 
 function decorate(m0, today, subs) {
-  const ss = subState(subOf(m0, subs), today);
+  const ss = subState(subOf(m0, subs), today, m0, subs);
   // 해지 신청·결제 실패한 구독은 결제된 날까지 쓴다 (그 날이 이미 지났으면 브로제이 기간을 본다)
   const m = ss && ss.end && ss.end >= today ? { ...m0, ends_on: ss.end } : m0;
   const live = ss && (ss.kind === '구독 중' || ss.kind === '쉬어가기');
@@ -74,7 +100,7 @@ function decorate(m0, today, subs) {
     ...m,
     holding: m.holding || (ss && ss.kind === '쉬어가기') || false,
     stage,
-    sub: ss ? ss.kind : null, next_billing: live ? ss.next : null,
+    sub: ss ? ss.kind : null, next_billing: live ? ss.next : null, sub_linked: ss ? !ss.unlinked : false,
     days_left: live ? null : m.ends_on ? daysBetween(today, m.ends_on) : null,
     days_absent: m.last_attended_on ? daysBetween(m.last_attended_on, today) : null,
   };
@@ -310,6 +336,27 @@ async function taskUndo({ key }) {
   return [200, { success: true }];
 }
 
+// ---------- 월구독 연결 (가족 카드로 결제하는 회원 등) ----------
+async function subSearch({ q }) {
+  const t = String(q || '').trim().slice(0, 20);
+  let query = supabase.from('subscribers').select('id,name,phone,plan,status,next_billing_date').order('created_at', { ascending: false }).limit(20);
+  if (t) query = /^\d{3,}$/.test(t) ? query.ilike('phone', `%${t}%`) : query.ilike('name', `%${t.replace(/[%_,()]/g, '')}%`);
+  const { data, error } = await query;
+  if (error) throw error;
+  return [200, { subscribers: data.map((r) => ({ id: r.id, name: r.name, plan: r.plan, status: r.status, next_billing_date: r.next_billing_date, phone4: digitsOf(r.phone).slice(-4) })) }];
+}
+async function subLink({ member_id, subscriber_id }) {
+  if (!member_id) return [400, { error: '필수 정보 누락' }];
+  if (subscriber_id) {
+    const ex = await supabase.from('subscribers').select('id').eq('id', subscriber_id).maybeSingle();
+    if (ex.error) throw ex.error;
+    if (!ex.data) return [400, { error: '구독을 찾을 수 없어요' }];
+  }
+  const { error } = await supabase.from('crm_members').update({ subscriber_id: subscriber_id || null, updated_at: new Date().toISOString() }).eq('id', member_id);
+  if (error) throw error;
+  return member({ id: member_id });
+}
+
 // ---------- 직원 명단 ----------
 async function staffList() {
   const { data, error } = await supabase.from('crm_staff').select('id,name,role,active').eq('active', true).order('created_at');
@@ -407,9 +454,12 @@ async function member({ id }) {
   const err = m.error || passes.error || payments.error || lockers.error || inquiries.error;
   if (err) throw err;
   if (!m.data) return [404, { error: '회원을 찾을 수 없어요' }];
-  const { checkin_code, subscriber_id, photo_path, ...safe } = m.data; // 출석 번호는 화면에 안 보낸다
+  const { checkin_code, photo_path, ...safe } = m.data; // 출석 번호는 화면에 안 보낸다
+  const S = await subsMap();
+  const sb = subOf(safe, S);
   return [200, {
-    member: { ...decorate(safe, today, await subsMap()), photo_url: await photoUrl(photo_path) },
+    member: { ...decorate(safe, today, S), photo_url: await photoUrl(photo_path),
+      subscription: sb ? { id: sb.id, name: sb.name, plan: sb.plan, status: sb.status, next_billing_date: sb.next_billing_date, phone4: digitsOf(sb.phone).slice(-4), linked: safe.subscriber_id === sb.id } : null },
     passes: passes.data, payments: payments.data,
     lockers: lockers.data.map(({ lock_code, ...l }) => l),
     inquiries: inquiries.data,
@@ -482,7 +532,7 @@ async function checkinFind({ digits }) {
   const d = String(digits || '').replace(/\D/g, '');
   if (d.length !== 4) return [400, { error: '번호 뒷자리 4개를 눌러주세요' }];
   const today = todayKST();
-  const [{ data, error }, subs] = await Promise.all([supabase.from('crm_members').select('id,name,phone,stage,holding,ends_on,first_started_on,last_attended_on,photo_path').like('phone', `%-${d}`), subsMap()]);
+  const [{ data, error }, subs] = await Promise.all([supabase.from('crm_members').select('id,name,phone,stage,holding,ends_on,first_started_on,last_attended_on,photo_path,subscriber_id').like('phone', `%-${d}`), subsMap()]);
   if (error) throw error;
   const list = data.map((m) => decorate(m, today, subs))
     .sort((a, b) => (a.stage === '만료·이탈') - (b.stage === '만료·이탈'));
@@ -492,7 +542,7 @@ async function checkinFind({ digits }) {
 async function checkin({ id }) {
   if (!id) return [400, { error: '필수 정보 누락' }];
   const today = todayKST();
-  const { data: m, error } = await supabase.from('crm_members').select('id,name,phone,stage,holding,ends_on,first_started_on,last_attended_on,total_visits,photo_path').eq('id', id).maybeSingle();
+  const { data: m, error } = await supabase.from('crm_members').select('id,name,phone,stage,holding,ends_on,first_started_on,last_attended_on,total_visits,photo_path,subscriber_id').eq('id', id).maybeSingle();
   if (error) throw error;
   if (!m) return [404, { error: '회원을 찾을 수 없어요' }];
   const d = decorate(m, today, await subsMap());
@@ -541,7 +591,7 @@ async function photoUpload({ id, image }) {
 }
 
 const ACTIONS = { dashboard, members, member, lockerBoard, kioskRegister, checkinFind, checkin, photoUpload,
-  taskDone, taskUndo, staffList, staffAdd, staffRemove, financeGet, financeSave, salesYear };
+  taskDone, taskUndo, staffList, staffAdd, staffRemove, financeGet, financeSave, salesYear, subSearch, subLink };
 const KIOSK_OK = ['checkinFind', 'checkin', 'photoUpload'];
 
 export default async function handler(req, res) {
