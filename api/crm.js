@@ -17,7 +17,8 @@ const daysBetween = (a, b) => Math.round((Date.parse(b) - Date.parse(a)) / DAY);
 // 순서: ① 회원에 직접 연결해 둔 구독(가족 결제 등) ② 번호+이름 같음 ③ 이름만 같음(한 명일 때) ④ 번호만 같고 결제 중인 구독
 // 하나도 없으면 브로제이 구독 이용권으로 본다 (자동결제라 만료로 안 셈)
 const digitsOf = (p) => String(p || '').replace(/\D/g, '');
-async function subsMap() {
+async function subsMap() { return memo('subs', 60000, subsMapRaw); }
+async function subsMapRaw() {
   const [subs, bj] = await Promise.all([
     supabase.from('subscribers').select('id,name,phone,plan,status,next_billing_date,cancelled_at,paused_at,created_at').order('created_at', { ascending: true }),
     selectAll(() => supabase.from('crm_passes').select('member_id').in('status', ['사용 중', '예정', '홀딩']).ilike('product_name', '%구독%')),
@@ -80,15 +81,28 @@ function liveStage(m, today, ss) {
 
 const MEMBER_COLS = 'id,name,phone,gender,usage_tag,stage,holding,first_started_on,ends_on,last_attended_on,total_visits,lifetime_paid,counselor,trainer,source,marketing_consent,memo,subscriber_id';
 
+// 1000줄씩 나눠 받기. 서버(미국)와 DB(도쿄)가 멀어서 한 번에 4쪽씩 동시에 받는다.
 async function selectAll(build) {
   const rows = [];
-  for (let from = 0; ; from += 1000) {
-    const { data, error } = await build().range(from, from + 999);
-    if (error) throw error;
-    rows.push(...data);
-    if (data.length < 1000) return rows;
+  for (let from = 0; ; from += 4000) {
+    const pages = await Promise.all([0, 1, 2, 3].map((i) => build().range(from + i * 1000, from + i * 1000 + 999)));
+    for (const { data, error } of pages) {
+      if (error) throw error;
+      rows.push(...data);
+      if (data.length < 1000) return rows;
+    }
   }
 }
+// 같은 서버가 연달아 받으면 잠깐 기억해 둔 결과를 쓴다 (바꾸는 요청이 오면 지운다)
+const CACHE = new Map();
+async function memo(key, ms, fn) {
+  const hit = CACHE.get(key);
+  if (hit && Date.now() - hit.at < ms) return hit.val;
+  const val = await fn();
+  CACHE.set(key, { at: Date.now(), val });
+  return val;
+}
+const clearCache = () => CACHE.clear();
 
 function decorate(m0, today, subs) {
   const ss = subState(subOf(m0, subs), today, m0, subs);
@@ -145,12 +159,18 @@ async function getFinance() {
 }
 
 // 결제 + 상품 이름 (매출 묶음 계산용)
-async function paymentsWithGroup(fromISO) {
-  const [pays, passes] = await Promise.all([
-    selectAll(() => supabase.from('crm_payments').select('amount,paid_at,pass_id,member_id,kind').gte('paid_at', fromISO)),
-    selectAll(() => supabase.from('crm_passes').select('id,product_name,category')),
-  ]);
-  const pm = Object.fromEntries(passes.map((p) => [p.id, p]));
+async function passesByIds(ids, known = {}) {
+  const need = [...new Set(ids.filter((id) => id && !known[id]))];
+  const chunks = [];
+  for (let i = 0; i < need.length; i += 150) chunks.push(need.slice(i, i + 150));
+  const res = await Promise.all(chunks.map((c) => supabase.from('crm_passes').select('id,product_name,category').in('id', c)));
+  const out = { ...known };
+  for (const { data, error } of res) { if (error) throw error; data.forEach((p) => { out[p.id] = p; }); }
+  return out;
+}
+async function paymentsWithGroup(fromISO, known, toISO) {
+  const pays = await selectAll(() => { let q = supabase.from('crm_payments').select('amount,paid_at,pass_id,member_id,kind').gte('paid_at', fromISO); if (toISO) q = q.lt('paid_at', toISO); return q; });
+  const pm = await passesByIds(pays.map((p) => p.pass_id), known);
   return pays.map((p) => { const ps = pm[p.pass_id] || {}; return { ...p, day: kstDate(p.paid_at), group: salesGroup(ps.product_name, ps.category) }; });
 }
 
@@ -198,19 +218,24 @@ function buildTasks(all, today, inGym, passByMember) {
 }
 
 // ---------- 대시보드 ----------
-async function dashboard() {
+async function dashboard() { return memo('dashboard', 20000, dashboardRaw); }
+async function dashboardRaw() {
   const today = todayKST();
   const month = today.slice(0, 7);
   const recentCut = new Date(Date.parse(today) - 400 * DAY).toISOString().slice(0, 10);
   const todayStartISO = new Date(Date.parse(`${today}T00:00:00+09:00`)).toISOString();
   const monthStartISO = new Date(Date.parse(`${month}-01T00:00:00+09:00`)).toISOString();
-  const [members, allPasses, pays, lockers, assigns, inq, totalCount, snap, att, attPast, finance, staff, subs, doneRows] = await Promise.all([
+  const [members, allPasses, _pays, lockers, assigns, inq, totalCount, snap, att, attPast, finance, staff, subs, doneRows] = await Promise.all([
     Promise.all([
       selectAll(() => supabase.from('crm_members').select(MEMBER_COLS).neq('stage', '만료·이탈')),
       selectAll(() => supabase.from('crm_members').select(MEMBER_COLS).eq('stage', '만료·이탈').gte('ends_on', recentCut)),
     ]).then(([a, b]) => a.concat(b)),
-    selectAll(() => supabase.from('crm_passes').select('member_id,category,product_name,status,starts_on,ends_on,remaining_count,total_count')),
-    paymentsWithGroup(monthStartISO),
+    // 최근 200일 안에 끝나거나 아직 안 끝난 이용권만 (6개월 추이·이용권 구성에 충분)
+    Promise.all([
+      selectAll(() => supabase.from('crm_passes').select('id,member_id,category,product_name,status,starts_on,ends_on,remaining_count,total_count').gte('ends_on', new Date(Date.parse(today) - 200 * DAY).toISOString().slice(0, 10))),
+      selectAll(() => supabase.from('crm_passes').select('id,member_id,category,product_name,status,starts_on,ends_on,remaining_count,total_count').is('ends_on', null)),
+    ]).then(([a, b]) => a.concat(b)),
+    null,
     supabase.from('crm_lockers').select('number'),
     selectAll(() => supabase.from('crm_locker_assignments').select('locker_no,member_id,status,ends_on').in('status', ['사용 중', '예정', '홀딩'])),
     supabase.from('crm_inquiries').select('id,inquired_at,member_id').gte('inquired_at', new Date(Date.parse(today) - 30 * DAY).toISOString()),
@@ -224,6 +249,7 @@ async function dashboard() {
     selectAll(() => supabase.from('crm_tasks').select('task_key,done_by,done_at,kind').gte('done_at', monthStartISO)),
   ]);
   for (const r of [lockers, inq, totalCount, snap, staff]) if (r.error) throw r.error;
+  const pays = await paymentsWithGroup(monthStartISO, Object.fromEntries(allPasses.map((p) => [p.id, p])));
 
   const all = members.map((m) => decorate(m, today, subs));
   const active = all.filter((m) => m.stage !== '만료·이탈');
@@ -357,16 +383,24 @@ async function subLink({ member_id, subscriber_id }) {
   return member({ id: member_id });
 }
 
-// ---------- 직원 명단 ----------
-async function staffList() {
-  const { data, error } = await supabase.from('crm_staff').select('id,name,role,active').eq('active', true).order('created_at');
+// ---------- 직원 명단 · 직책 ----------
+const DEFAULT_ROLES = ['대표', '매니저', '인포', '트레이너', 'FC'];
+async function getRoles() {
+  const { data, error } = await supabase.from('crm_settings').select('value').eq('key', 'roles').maybeSingle();
   if (error) throw error;
-  return [200, { staff: data }];
+  const list = data && Array.isArray(data.value) ? data.value : DEFAULT_ROLES;
+  return list.map((r) => String(r).trim().slice(0, 20)).filter(Boolean);
 }
+async function staffList() {
+  const [{ data, error }, roles] = await Promise.all([supabase.from('crm_staff').select('id,name,role,active').eq('active', true).order('created_at'), getRoles()]);
+  if (error) throw error;
+  return [200, { staff: data, roles }];
+}
+const cleanRole = (role, roles) => (role && roles.includes(String(role).trim()) ? String(role).trim() : null);
 async function staffAdd({ name, role }) {
   const n = String(name || '').trim().slice(0, 20);
   if (!n) return [400, { error: '이름을 적어주세요' }];
-  const r = ['대표', '매니저', '인포', '트레이너', 'FC'].includes(role) ? role : null;
+  const r = cleanRole(role, await getRoles());
   const ex = await supabase.from('crm_staff').select('id').eq('name', n).maybeSingle();
   if (ex.error) throw ex.error;
   const q = ex.data ? supabase.from('crm_staff').update({ role: r, active: true }).eq('id', ex.data.id) : supabase.from('crm_staff').insert({ name: n, role: r, active: true });
@@ -374,11 +408,111 @@ async function staffAdd({ name, role }) {
   if (error) throw error;
   return staffList();
 }
+// 이름·직책 고치기. 이름을 바꾸면 이번 달 처리 기록의 이름도 같이 바꾼다.
+async function staffUpdate({ id, name, role }) {
+  const n = String(name || '').trim().slice(0, 20);
+  if (!id || !n) return [400, { error: '이름을 적어주세요' }];
+  const cur = await supabase.from('crm_staff').select('id,name').eq('id', id).maybeSingle();
+  if (cur.error) throw cur.error;
+  if (!cur.data) return [404, { error: '직원을 찾을 수 없어요' }];
+  const dup = await supabase.from('crm_staff').select('id').eq('name', n).eq('active', true).maybeSingle();
+  if (dup.error) throw dup.error;
+  if (dup.data && dup.data.id !== id) return [400, { error: '같은 이름이 이미 있어요' }];
+  const { error } = await supabase.from('crm_staff').update({ name: n, role: cleanRole(role, await getRoles()) }).eq('id', id);
+  if (error) throw error;
+  if (cur.data.name !== n) {
+    const t = await supabase.from('crm_tasks').update({ done_by: n }).eq('done_by', cur.data.name);
+    if (t.error) throw t.error;
+  }
+  return staffList();
+}
 async function staffRemove({ id }) {
   if (!id) return [400, { error: '필수 정보 누락' }];
   const { error } = await supabase.from('crm_staff').update({ active: false }).eq('id', id);
   if (error) throw error;
   return staffList();
+}
+async function rolesSave({ roles }) {
+  if (!Array.isArray(roles) || roles.length > 20) return [400, { error: '직책이 맞지 않아요' }];
+  const list = [...new Set(roles.map((r) => String(r || '').trim().slice(0, 20)).filter(Boolean))];
+  if (!list.length) return [400, { error: '직책을 하나 이상 남겨주세요' }];
+  const { error } = await supabase.from('crm_settings').upsert({ key: 'roles', value: list, updated_at: new Date().toISOString() }, { onConflict: 'key' });
+  if (error) throw error;
+  return staffList();
+}
+
+// ---------- 보고서 ----------
+// 기간: week(이번 주) · lastweek · month(이번 달) · lastmonth. 같은 길이의 바로 전 기간과 비교한다.
+function periodOf(kind, today) {
+  const d = new Date(`${today}T00:00:00Z`);
+  const iso = (x) => x.toISOString().slice(0, 10);
+  const add = (x, n) => { const y = new Date(x); y.setUTCDate(y.getUTCDate() + n); return y; };
+  let from, to, label;
+  if (kind === 'week' || kind === 'lastweek') {
+    const mon = add(d, -((d.getUTCDay() + 6) % 7));
+    from = kind === 'week' ? mon : add(mon, -7); to = add(from, 6);
+    label = kind === 'week' ? '이번 주' : '지난 주';
+    const pf = add(from, -7);
+    return { kind, label, from: iso(from), to: iso(to), prevFrom: iso(pf), prevTo: iso(add(pf, 6)) };
+  }
+  const y = d.getUTCFullYear(), m = d.getUTCMonth() - (kind === 'lastmonth' ? 1 : 0);
+  from = new Date(Date.UTC(y, m, 1)); to = new Date(Date.UTC(y, m + 1, 0));
+  label = kind === 'lastmonth' ? '지난 달' : '이번 달';
+  return { kind, label, from: iso(from), to: iso(to), prevFrom: iso(new Date(Date.UTC(y, m - 1, 1))), prevTo: iso(new Date(Date.UTC(y, m, 0))) };
+}
+const kstStart = (d) => new Date(Date.parse(`${d}T00:00:00+09:00`)).toISOString();
+const kstEndEx = (d) => new Date(Date.parse(`${d}T00:00:00+09:00`) + DAY).toISOString();
+async function report({ period = 'month' }) {
+  const today = todayKST();
+  const P = periodOf(['week', 'lastweek', 'month', 'lastmonth'].includes(period) ? period : 'month', today);
+  const [pays, passes, att, tasks, inq, subs, finance] = await Promise.all([
+    paymentsWithGroup(kstStart(P.prevFrom), {}, kstEndEx(P.to)),
+    selectAll(() => supabase.from('crm_passes').select('id,member_id,category,product_name,status,starts_on,ends_on').gte('ends_on', new Date(Date.parse(P.prevFrom) - 400 * DAY).toISOString().slice(0, 10))),
+    selectAll(() => supabase.from('crm_attendance').select('member_id,checked_at').gte('checked_at', kstStart(P.prevFrom)).lt('checked_at', kstEndEx(P.to))),
+    selectAll(() => supabase.from('crm_tasks').select('kind,done_by,done_at').gte('done_at', kstStart(P.prevFrom)).lt('done_at', kstEndEx(P.to))),
+    supabase.from('crm_inquiries').select('inquired_at').gte('inquired_at', kstStart(P.prevFrom)).lt('inquired_at', kstEndEx(P.to)),
+    supabase.from('subscribers').select('created_at,cancelled_at,status'),
+    getFinance(),
+  ]);
+  if (inq.error || subs.error) throw inq.error || subs.error;
+  const inR = (d, a, b) => d >= a && d <= b;
+  const side = (a, b) => {
+    const ps = pays.filter((p) => inR(p.day, a, b));
+    const sum = (f) => ps.filter(f).reduce((x, p) => x + p.amount, 0);
+    const membership = sum((p) => MEMBERSHIP.includes(p.group)), pt = sum((p) => p.group === 'PT');
+    const newM = new Set(ps.filter((p) => p.kind === '신규').map((p) => p.member_id)).size;
+    const renewM = new Set(ps.filter((p) => p.kind === '재등록').map((p) => p.member_id)).size;
+    // 재등록률: 이 기간에 끝난 회원권(PT·구독 제외) 중 다음 회원권을 산 비율
+    const nonPT = passes.filter((x) => !['무효', '환불'].includes(x.status) && !['PT', '월구독'].includes(salesGroup(x.product_name, x.category)) && !/체험/.test(x.product_name || ''));
+    const ended = nonPT.filter((x) => x.ends_on && inR(x.ends_on, a, b));
+    const later = {};
+    nonPT.forEach((x) => { (later[x.member_id] = later[x.member_id] || []).push(x); });
+    const endedMembers = [...new Set(ended.map((x) => x.member_id))];
+    const renewed = endedMembers.filter((mid) => { const mine = later[mid]; const lastEnd = ended.filter((x) => x.member_id === mid).map((x) => x.ends_on).sort().pop(); return mine.some((x) => x.ends_on > lastEnd && x.starts_on && x.starts_on <= new Date(Date.parse(lastEnd) + 45 * DAY).toISOString().slice(0, 10)); }).length;
+    const at = att.filter((x) => inR(kstDate(x.checked_at), a, b));
+    const days = Math.round((Date.parse(b) - Date.parse(a)) / DAY) + 1;
+    const hours = Array(24).fill(0); at.forEach((x) => hours[kstHour(x.checked_at)]++);
+    const tk = tasks.filter((x) => inR(kstDate(x.done_at), a, b));
+    const byStaff = {}; tk.forEach((x) => { byStaff[x.done_by] = (byStaff[x.done_by] || 0) + 1; });
+    const subNew = (subs.data || []).filter((x) => x.created_at && inR(kstDate(x.created_at), a, b)).length;
+    const subCancel = (subs.data || []).filter((x) => x.cancelled_at && inR(kstDate(x.cancelled_at), a, b)).length;
+    const daily = {}; ps.forEach((p) => { daily[p.day] = (daily[p.day] || 0) + p.amount; });
+    return { from: a, to: b, days, membership, pt, total: membership + pt, groups: Object.fromEntries(['헬스', '월구독', 'GX', '기타', 'PT'].map((g) => [g, sum((p) => p.group === g)])),
+      payCount: ps.length, newMembers: newM, renewMembers: renewM, ended: endedMembers.length, renewed, renewRate: endedMembers.length ? Math.round(renewed / endedMembers.length * 100) : null,
+      visits: at.length, visitors: new Set(at.map((x) => x.member_id)).size, perDay: Math.round(at.length / days * 10) / 10, peakHour: at.length ? hours.indexOf(Math.max(...hours)) : null,
+      tasksDone: tk.length, byStaff, inquiries: (inq.data || []).filter((x) => inR(kstDate(x.inquired_at), a, b)).length, subNew, subCancel, daily };
+  };
+  // 아직 진행 중인 기간은 지난 기간도 같은 날짜 수만큼만 비교한다 (예: 1~19일 vs 1~19일)
+  const lastPay = pays.reduce((a, p) => (p.day > a ? p.day : a), '');
+  const dataEnd = [P.to, today, lastPay || today].sort()[0];
+  const n = Math.max(1, Math.round((Date.parse(dataEnd) - Date.parse(P.from)) / DAY) + 1);
+  const prevEnd = [P.prevTo, new Date(Date.parse(P.prevFrom) + (n - 1) * DAY).toISOString().slice(0, 10)].sort()[0];
+  const partial = dataEnd < P.to;
+  const cur = side(P.from, partial ? dataEnd : P.to), prev = side(P.prevFrom, partial ? prevEnd : P.prevTo);
+  const isMonth = P.kind === 'month' || P.kind === 'lastmonth';
+  const elapsed = P.to > today ? Math.round((Date.parse(today) - Date.parse(P.from)) / DAY) + 1 : cur.days;
+  const goal = isMonth ? finance.target : Math.round(finance.target * 7 / 30);
+  return [200, { period: { ...P, compareTo: partial ? dataEnd : P.to, prevCompareTo: partial ? prevEnd : P.prevTo, partial }, today, elapsed, goal, breakeven: isMonth ? finance.breakeven : Math.round(finance.breakeven * 7 / 30), cur, prev, lastPayDay: pays.reduce((a, p) => (p.day > a ? p.day : a), '') || null }];
 }
 
 // ---------- 비용·목표 ----------
@@ -591,8 +725,9 @@ async function photoUpload({ id, image }) {
 }
 
 const ACTIONS = { dashboard, members, member, lockerBoard, kioskRegister, checkinFind, checkin, photoUpload,
-  taskDone, taskUndo, staffList, staffAdd, staffRemove, financeGet, financeSave, salesYear, subSearch, subLink };
+  taskDone, taskUndo, staffList, staffAdd, staffRemove, financeGet, financeSave, salesYear, subSearch, subLink, staffUpdate, rolesSave, report };
 const KIOSK_OK = ['checkinFind', 'checkin', 'photoUpload'];
+const WRITES = ['checkin', 'photoUpload', 'taskDone', 'taskUndo', 'staffAdd', 'staffUpdate', 'staffRemove', 'financeSave', 'subLink', 'rolesSave'];
 
 export default async function handler(req, res) {
   cors(req, res);
@@ -602,10 +737,12 @@ export default async function handler(req, res) {
   const fn = ACTIONS[params.action];
   if (!fn) return res.status(400).json({ error: '알 수 없는 요청' });
   const tk = bearer(req);
-  const admin = await verifyToken(supabase, tk);
-  if (!admin && !(KIOSK_OK.includes(params.action) && isKiosk(tk))) return res.status(401).json({ error: '로그인이 필요해요' });
+  const kiosk = KIOSK_OK.includes(params.action) && isKiosk(tk);
+  if (!kiosk && !(await verifyToken(supabase, tk))) return res.status(401).json({ error: '로그인이 필요해요' });
   try {
+    if (WRITES.includes(params.action)) clearCache();
     const [code, body] = await fn(params);
+    if (WRITES.includes(params.action)) clearCache();
     return res.status(code).json(body);
   } catch (e) {
     console.error('crm', params.action, e);
