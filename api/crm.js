@@ -604,7 +604,7 @@ async function msgRulesSave({ rules, attendNotice }) {
 
 // ---------- 노션 연동 (읽기만) ----------
 // 노션 '워크인 로그' → crm_inquiries, 'PT회원관리'의 트레이너별 '회원 목록' → crm_pt_notion
-// 서버 환경 변수 NOTION_TOKEN 이 있어야 하고, 두 페이지가 990crm 연결에 공유돼 있어야 한다.
+// 서버 환경 변수 NOTION_TOKEN 이 있어야 하고, 두 페이지가 990crm 연결(읽기 전용)에 공유돼 있어야 한다.
 const NOTION_WALKIN_DB = '2afb2efeb4e380f490adda87804061a7';
 const NOTION_PT_ROOT = '163b2efeb4e3808a8d43fdca52b84401';
 async function notion(path, body) {
