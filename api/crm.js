@@ -246,7 +246,7 @@ async function dashboardRaw() {
     getFinance(),
     supabase.from('crm_staff').select('id,name,role').eq('active', true).order('created_at'),
     subsMap(),
-    selectAll(() => supabase.from('crm_tasks').select('task_key,done_by,done_at,kind').gte('done_at', monthStartISO)),
+    selectAll(() => supabase.from('crm_tasks').select('task_key,done_by,done_at,kind,due_on,result').gte('done_at', new Date(Date.parse(monthStartISO) - 7 * DAY).toISOString())),
     staffMeta(), getRoles(),
   ]);
   for (const r of [lockers, inq, totalCount, snap, staff]) if (r.error) throw r.error;
@@ -320,13 +320,15 @@ async function dashboardRaw() {
       tag: `리턴${late ? ` ${late}일 지남` : ' 오늘'}`, title: `상담 ${daysBetween(kstDate(q.inquired_at), today)}일째 · 리턴 연락할 날`,
       sub: [q.source || '문의', ...(sm.reason ? [`미등록 사유: ${sm.reason}`] : []), ...(q.staff_name ? [`상담 ${q.staff_name}`] : [])], action: '리턴 전화', group: '오늘 안에' });
   });
-  const done = Object.fromEntries(doneRows.map((r) => [r.task_key, r]));
+  const done = Object.fromEntries(doneRows.filter((r) => !r.task_key.startsWith('snz:')).map((r) => [r.task_key, r]));
+  // '안 받음'으로 미룬 일: due_on 전까지 숨기고, 그날 다시 올라온다
+  const snz = Object.fromEntries(doneRows.filter((r) => r.task_key.startsWith('snz:') && r.due_on && r.due_on > today).map((r) => [r.task_key.slice(4), r]));
   const doneToday = doneRows.filter((r) => kstDate(r.done_at) === today);
   const list = tasks.filter((t) => !done[t.key] || kstDate(done[t.key].done_at) === today)
-    .map((t) => (done[t.key] ? { ...t, done: true, done_by: done[t.key].done_by, done_at: done[t.key].done_at } : t));
+    .map((t) => (done[t.key] ? { ...t, done: true, done_by: done[t.key].done_by, done_at: done[t.key].done_at, result: done[t.key].result } : snz[t.key] ? { ...t, snoozed: snz[t.key].due_on, snoozed_by: snz[t.key].done_by } : t));
   const staffStats = {};
   (staff.data || []).forEach((s) => { staffStats[s.name] = { today: 0, month: 0 }; });
-  doneRows.forEach((r) => { const s = (staffStats[r.done_by] = staffStats[r.done_by] || { today: 0, month: 0 }); s.month++; if (kstDate(r.done_at) === today) s.today++; });
+  doneRows.filter((r) => r.done_at >= monthStartISO).forEach((r) => { const s = (staffStats[r.done_by] = staffStats[r.done_by] || { today: 0, month: 0 }); s.month++; if (kstDate(r.done_at) === today) s.today++; });
 
   const thisMonthLapsed = all.filter((m) => m.stage === '만료·이탈' && m.ends_on && m.ends_on.slice(0, 7) === month).length;
   return [200, {
@@ -352,7 +354,23 @@ async function dashboardRaw() {
 
 // ---------- 할 일 완료 ----------
 const TASK_KEY = /^(exp|pay|abs14|abs30|nov|new|lapse|inq):[0-9a-f-]{36}:[0-9-]{0,10}$/;
-async function taskDone({ key, staff, note }) {
+const TASK_RESULTS = ['연락 완료', '문자 보냄', '직접 만남', '재등록 의사 있음', '거절', '안 받음'];
+const TASK_LABEL = { exp: '재등록 안내', pay: '결제 실패 안내', abs14: '미출석 안부', abs30: '장기 미출석 연락', nov: '첫 방문 연락', new: '신규 안부', lapse: '복귀 안내', inq: '리턴 연락' };
+async function taskSnooze({ key, staff, days = 1 }) {
+  if (!TASK_KEY.test(String(key || ''))) return [400, { error: '할 일 정보가 맞지 않아요' }];
+  const name = String(staff || '').trim();
+  if (!name) return [400, { error: '처리한 직원을 골라주세요' }];
+  const n = Math.min(7, Math.max(1, Math.round(Number(days) || 1)));
+  const [kind, refId] = key.split(':');
+  const isInq = kind === 'inq';
+  const until = new Date(Date.parse(todayKST()) + n * DAY).toISOString().slice(0, 10);
+  const { error } = await supabase.from('crm_tasks').upsert({ task_key: `snz:${key}`, member_id: isInq ? null : refId, inquiry_id: isInq ? refId : null, kind: 'snooze', due_on: until, done_at: new Date().toISOString(), done_by: name, result: '안 받음 · 다시 연락' }, { onConflict: 'task_key' });
+  if (error) throw error;
+  if (!isInq) await supabase.from('crm_events').insert({ member_id: refId, kind: '할 일', body: `${TASK_LABEL[kind]} · 안 받음 → ${+until.slice(5, 7)}.${+until.slice(8)} 다시 연락`, staff_name: name });
+  return [200, { success: true, until }];
+}
+async function taskDone({ key, staff, note, result }) {
+  if (result && TASK_RESULTS.includes(result)) note = `${result}${note ? ` · ${note}` : ''}`;
   if (!TASK_KEY.test(String(key || ''))) return [400, { error: '할 일 정보가 맞지 않아요' }];
   const name = String(staff || '').trim();
   if (!name) return [400, { error: '처리한 직원을 골라주세요' }];
@@ -365,7 +383,7 @@ async function taskDone({ key, staff, note }) {
   const ins = await supabase.from('crm_tasks').upsert({ task_key: key, member_id, inquiry_id: isInq ? refId : null, kind, due_on: todayKST(), done_at: new Date().toISOString(), done_by: name, result: note ? String(note).slice(0, 300) : null }, { onConflict: 'task_key' });
   if (ins.error) throw ins.error;
   if (isInq) return [200, { success: true }];
-  await supabase.from('crm_events').insert({ member_id, kind: '할 일', body: `${({ exp: '재등록 안내', pay: '결제 실패 안내', abs14: '미출석 안부', abs30: '장기 미출석 연락', nov: '첫 방문 연락', new: '신규 안부', lapse: '복귀 안내' })[kind]} 완료${note ? ` · ${String(note).slice(0, 300)}` : ''}`, staff_name: name });
+  await supabase.from('crm_events').insert({ member_id, kind: '할 일', body: `${TASK_LABEL[kind]} 완료${note ? ` · ${String(note).slice(0, 300)}` : ''}`, staff_name: name });
   return [200, { success: true }];
 }
 async function taskUndo({ key }) {
@@ -581,6 +599,107 @@ async function revenue({ period = 'month' }) {
     unpaid: { count: fails.length, amount: fails.reduce((a, x) => a + (PLAN_PRICE[x.plan] || 39000), 0) },
     routes: { 토스자동결제: { amount: groups.월구독, count: pays.filter((p) => p.group === '월구독').length }, 인포결제: { amount: total - groups.월구독, count: pays.filter((p) => p.group !== '월구독').length } },
     list, listIsToday: listSrc.length > 0 }];
+}
+
+// ---------- 보고서 v2 (월 + 주차, 크마스터처럼 보기 쉽게) ----------
+const isTrialName = (nm) => /체험|^PT ?3회$/.test(nm || '');
+function monthWeeks(ym) {
+  const [y, m] = ym.split('-').map(Number), last = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  const out = []; for (let i = 0; i * 7 < last; i++) out.push({ n: i + 1, from: `${ym}-${String(i * 7 + 1).padStart(2, '0')}`, to: `${ym}-${String(Math.min(last, i * 7 + 7)).padStart(2, '0')}` });
+  return out;
+}
+async function reportV2({ ym, week }) {
+  const today = todayKST();
+  const YM = /^\d{4}-\d{2}$/.test(String(ym || '')) && ym <= today.slice(0, 7) ? ym : today.slice(0, 7);
+  const weeks = monthWeeks(YM), wk = weeks.find((w) => w.n === Number(week)) || null;
+  const iso = (t) => new Date(t).toISOString().slice(0, 10);
+  const [y, m] = YM.split('-').map(Number);
+  let from, to, prevFrom, prevTo, label;
+  if (wk) { from = wk.from; to = wk.to; prevFrom = iso(Date.parse(from) - 7 * DAY); prevTo = iso(Date.parse(from) - DAY); label = `${m}월 ${wk.n}주차`; }
+  else { from = `${YM}-01`; to = weeks[weeks.length - 1].to; prevFrom = iso(Date.UTC(y, m - 2, 1)); prevTo = iso(Date.UTC(y, m - 1, 0)); label = `${y}년 ${m}월`; }
+  // 진행 중인 기간은 지난 기간도 같은 날짜 수만큼만 비교
+  const partial = to > today, end = partial ? today : to;
+  const n = Math.round((Date.parse(end) - Date.parse(from)) / DAY) + 1;
+  const prevEnd = partial ? [prevTo, iso(Date.parse(prevFrom) + (n - 1) * DAY)].sort()[0] : prevTo;
+  const inR = (d, a, b) => d && d >= a && d <= b;
+  const t12 = iso(Date.UTC(y, m - 12, 1));
+  const [allPasses, pays, inqs, att, subs, members] = await Promise.all([
+    memo('passes_all', 120000, () => selectAll(() => supabase.from('crm_passes').select('id,member_id,product_name,category,status,starts_on,ends_on,total_count,registered_on,price_paid').neq('status', '무효'))),
+    paymentsWithGroup(kstStart(t12 < prevFrom ? t12 : prevFrom), {}, kstEndEx(to)),
+    selectAll(() => supabase.from('crm_inquiries').select('id,name,phone,member_id,source,result,summary,raw_note,inquired_at').or(INQ_OK)),
+    selectAll(() => supabase.from('crm_attendance').select('member_id,checked_at').gte('checked_at', kstStart(prevFrom)).lt('checked_at', kstEndEx(to))),
+    supabase.from('subscribers').select('cancelled_at,status,churn_reason'),
+    memo('members_min', 120000, () => selectAll(() => supabase.from('crm_members').select('id,name,phone'))),
+  ]);
+  if (subs.error) throw subs.error;
+  const person = Object.fromEntries(members.map((x) => [x.id, x]));
+  const passById = Object.fromEntries(allPasses.map((x) => [x.id, x]));
+  const byMember = {}; allPasses.forEach((x) => { (byMember[x.member_id] = byMember[x.member_id] || []).push(x); });
+  const firstReg = {}; allPasses.forEach((x) => { if (x.registered_on && (!firstReg[x.member_id] || x.registered_on < firstReg[x.member_id])) firstReg[x.member_id] = x.registered_on; });
+  const isCount = (x) => salesGroup(x.product_name, x.category) === 'PT' || (x.total_count > 0 && !/개월|구독/.test(x.product_name || ''));
+  // ① 회원 현황 (기간 마지막 날 기준)
+  const snap = (d) => {
+    const live = allPasses.filter((x) => x.starts_on && x.starts_on <= d && (!x.ends_on || x.ends_on >= d) && !isTrialName(x.product_name));
+    const all = new Set(live.map((x) => x.member_id)), per = new Set(live.filter((x) => !isCount(x)).map((x) => x.member_id)), cnt = new Set(live.filter(isCount).map((x) => x.member_id));
+    const hold = new Set(live.filter((x) => x.status === '홀딩').map((x) => x.member_id));
+    return { total: all.size, period: per.size, count: cnt.size, holding: hold.size };
+  };
+  const sNow = snap(end), sPrev = snap(prevEnd);
+  const trials = {}; allPasses.filter((x) => isTrialName(x.product_name) && inR(x.registered_on, from, end)).forEach((x) => { trials[x.product_name] = (trials[x.product_name] || 0) + 1; });
+  // ② 매출 현황
+  const pIn = pays.filter((p) => inR(p.day, from, end)), pPrev = pays.filter((p) => inR(p.day, prevFrom, prevEnd));
+  const sum = (a) => a.reduce((x, p) => x + p.amount, 0);
+  const groups = { 헬스: 0, GX: 0, 월구독: 0, PT: 0, 기타: 0 }; pIn.forEach((p) => { groups[p.group] = (groups[p.group] || 0) + p.amount; });
+  const top = {}; pIn.forEach((p) => { const nm = (passById[p.pass_id] || {}).product_name || '기타'; const o = (top[nm] = top[nm] || { name: nm, count: 0, amount: 0 }); o.count++; o.amount += p.amount; });
+  // ③ 고객 퍼널: 유입 → 체험 → 정규 등록(처음 오신 분) → 재등록
+  const qIn = inqs.filter((q) => inR(kstDate(q.inquired_at), from, end));
+  const bare = (v) => String(v || '').replace(/\(.*?\)|\s/g, '');
+  const trialPeople = {}, newPeople = {};
+  pIn.forEach((p) => {
+    const nm = (passById[p.pass_id] || {}).product_name || '';
+    if (isTrialName(nm)) { if (!trialPeople[p.member_id]) trialPeople[p.member_id] = { day: p.day, product: nm }; return; }
+    if (p.kind === '신규' && firstReg[p.member_id] && firstReg[p.member_id] >= from && !newPeople[p.member_id]) newPeople[p.member_id] = { day: p.day, product: nm };
+  });
+  // 브로제이가 '신규'로 안 찍었어도 처음 등록이 이 기간이면 처음 오신 분
+  allPasses.filter((x) => !isTrialName(x.product_name) && x.registered_on && inR(x.registered_on, from, end) && firstReg[x.member_id] === x.registered_on && !newPeople[x.member_id]).forEach((x) => { newPeople[x.member_id] = { day: x.registered_on, product: x.product_name }; });
+  const returnedN = new Set(pIn.filter((p) => p.kind === '신규' && !isTrialName((passById[p.pass_id] || {}).product_name) && firstReg[p.member_id] && firstReg[p.member_id] < from).map((p) => p.member_id)).size;
+  const inqOf = (mid, day) => {
+    const ps = person[mid] || {}, until = iso(Date.parse(day) + DAY), since = iso(Date.parse(day) - 180 * DAY);
+    let qs = inqs.filter((q) => (q.member_id === mid || (ps.phone && q.phone === ps.phone)) && kstDate(q.inquired_at) <= until);
+    if (!qs.length && ps.name) qs = inqs.filter((q) => bare(q.name) === bare(ps.name) && kstDate(q.inquired_at) <= until && kstDate(q.inquired_at) >= since);
+    return qs.map((q) => kstDate(q.inquired_at)).sort().pop() || null;
+  };
+  const regList = Object.entries(newPeople).map(([mid, v]) => { const q = inqOf(mid, v.day); return { member_id: mid, name: (person[mid] || {}).name || '-', day: v.day, product: v.product, origin: q && q >= from ? '이 기간 문의' : q ? '그 전 문의' : '워크인 로그에 없음', inq_day: q }; }).sort((a, b) => b.day.localeCompare(a.day));
+  const fromInq = regList.filter((r) => r.origin === '이 기간 문의').length;
+  const qState = (q) => (q.result === '등록' ? '전환 완료' : q.result === '미등록' ? '미전환' : '진행 중');
+  const inqList = qIn.map((q) => { const sm = parseInqSummary(q.summary); return { member_id: q.member_id, name: q.name, day: kstDate(q.inquired_at), state: qState(q), source: q.source, memo: [sm.reason ? `사유 ${sm.reason}` : '', sm.interest ? `관심 ${sm.interest}` : '', (q.raw_note || '').slice(0, 80)].filter(Boolean).join(' · ') }; }).sort((a, b) => b.day.localeCompare(a.day));
+  const trialList = Object.entries(trialPeople).map(([mid, v]) => { const conv = (byMember[mid] || []).some((x) => !isTrialName(x.product_name) && x.registered_on && x.registered_on >= v.day); return { member_id: mid, name: (person[mid] || {}).name || '-', day: v.day, product: v.product, state: conv ? '전환 완료' : '미전환' }; });
+  // 재등록: 이 기간에 끝난 회원권(PT·체험·월구독 제외) 중 45일 안에 다음 걸 산 사람
+  const nonPT = allPasses.filter((x) => !['PT', '월구독'].includes(salesGroup(x.product_name, x.category)) && !isTrialName(x.product_name));
+  const endedBy = {}; nonPT.filter((x) => inR(x.ends_on, from, end)).forEach((x) => { if (!endedBy[x.member_id] || x.ends_on > endedBy[x.member_id].ends_on) endedBy[x.member_id] = x; });
+  const renewList = Object.entries(endedBy).map(([mid, x]) => { const nx = (byMember[mid] || []).find((z) => z.id !== x.id && !isTrialName(z.product_name) && z.ends_on > x.ends_on && z.starts_on && z.starts_on <= iso(Date.parse(x.ends_on) + 45 * DAY)); return { member_id: mid, name: (person[mid] || {}).name || '-', day: x.ends_on, product: x.product_name, state: nx ? '재등록' : x.ends_on >= today ? '아직 남음' : '안 함', next: nx ? nx.product_name : null }; }).sort((a, b) => a.day.localeCompare(b.day));
+  const renewed = renewList.filter((r) => r.state === '재등록').length, endedDone = renewList.filter((r) => r.state !== '아직 남음').length;
+  // ④ 최근 12개월
+  const months = []; for (let i = 11; i >= 0; i--) months.push(iso(Date.UTC(y, m - 1 - i, 1)).slice(0, 7));
+  const trend = months.map((mo) => ({ ym: mo, revenue: pays.filter((p) => p.day.slice(0, 7) === mo).reduce((a, p) => a + p.amount, 0), newPeople: Object.values(firstReg).filter((d) => d.slice(0, 7) === mo).length, hasPays: mo >= '2025-12' }));
+  // ⑤ 출석
+  const aIn = att.filter((x) => inR(kstDate(x.checked_at), from, end)), aPrev = att.filter((x) => inR(kstDate(x.checked_at), prevFrom, prevEnd));
+  const hours = Array(24).fill(0); aIn.forEach((x) => hours[kstHour(x.checked_at)]++);
+  const dayCnt = new Set(aIn.map((x) => kstDate(x.checked_at))).size;
+  // ⑥ 왜 그런가 (경로·미등록 사유·해지 사유)
+  const src = {}; qIn.forEach((q) => { const k = q.source || '기록 없음'; const o = (src[k] = src[k] || { source: k, count: 0, joined: 0 }); o.count++; if (q.result === '등록') o.joined++; });
+  const noReg = {}; qIn.forEach((q) => { const r = parseInqSummary(q.summary).reason; if (r) noReg[r] = (noReg[r] || 0) + 1; });
+  const churn = {}; (subs.data || []).filter((x) => x.status === 'cancelled' && x.cancelled_at && inR(kstDate(x.cancelled_at), from, end) && x.churn_reason && !/테스트|복구/.test(x.churn_reason)).forEach((x) => { const k = String(x.churn_reason).slice(0, 14); churn[k] = (churn[k] || 0) + 1; });
+  return [200, {
+    today, period: { ym: YM, week: wk ? wk.n : null, label, from, to, end, prevFrom, prevTo: prevEnd, partial, weeks, minYm: '2025-12', lastPayDay: pays.reduce((a, p) => (p.day > a ? p.day : a), '') || null },
+    members: { now: sNow, prev: sPrev, trials: Object.entries(trials).map(([name, count]) => ({ name, count })).sort((a, b) => b.count - a.count) },
+    sales: { total: sum(pIn), prev: sum(pPrev), count: pIn.length, groups, refund: 0, top: Object.values(top).sort((a, b) => b.amount - a.amount).slice(0, 5) },
+    funnel: { inquiries: qIn.length, trial: trialList.length, regular: regList.length, renewed, ended: endedDone, endedAll: renewList.length, fromInq, trialConv: trialList.filter((t) => t.state === '전환 완료').length, returned: returnedN,
+      lists: { 유입: inqList, 체험: trialList, 정규: regList, 재등록: renewList } },
+    trend,
+    attendance: { visits: aIn.length, visitors: new Set(aIn.map((x) => x.member_id)).size, prevVisits: aPrev.length, perDay: dayCnt ? Math.round(aIn.length / dayCnt * 10) / 10 : 0, peakHour: aIn.length ? hours.indexOf(Math.max(...hours)) : null, days: dayCnt },
+    why: { sources: Object.values(src).sort((a, b) => b.count - a.count), noReg: Object.entries(noReg).sort((a, b) => b[1] - a[1]), churn: Object.entries(churn).sort((a, b) => b[1] - a[1]).slice(0, 6) },
+  }];
 }
 
 // ---------- 자동 문자 규칙 (발송 업체 연결 전: 켜고 끄기와 대상 수만) ----------
@@ -1340,9 +1459,9 @@ async function photoUpload({ id, image }) {
 }
 
 const ACTIONS = { dashboard, members, member, lockerBoard, kioskRegister, checkinFind, checkin, photoUpload,
-  taskDone, taskUndo, staffList, staffAdd, staffRemove, financeGet, financeSave, salesYear, subSearch, subLink, staffUpdate, rolesSave, report, memoAdd, inquiryAdd, inquiryList, inquiryUpdate, ptBoard, revenue, msgRules, msgRulesSave, ptSession, ptAssign, ptSetLeft, notionSync, passUpdate, paymentMethod, staffOrder, roleColor };
+  taskDone, taskUndo, staffList, staffAdd, staffRemove, financeGet, financeSave, salesYear, subSearch, subLink, staffUpdate, rolesSave, report, memoAdd, inquiryAdd, inquiryList, inquiryUpdate, ptBoard, revenue, msgRules, msgRulesSave, ptSession, ptAssign, ptSetLeft, notionSync, passUpdate, paymentMethod, staffOrder, roleColor, taskSnooze, reportV2 };
 const KIOSK_OK = ['checkinFind', 'checkin', 'photoUpload'];
-const WRITES = ['checkin', 'photoUpload', 'taskDone', 'taskUndo', 'staffAdd', 'staffUpdate', 'staffRemove', 'financeSave', 'subLink', 'rolesSave', 'memoAdd', 'inquiryAdd', 'inquiryUpdate', 'msgRulesSave', 'ptSession', 'ptAssign', 'ptSetLeft', 'notionSync', 'passUpdate', 'paymentMethod', 'staffOrder', 'roleColor'];
+const WRITES = ['checkin', 'photoUpload', 'taskDone', 'taskUndo', 'staffAdd', 'staffUpdate', 'staffRemove', 'financeSave', 'subLink', 'rolesSave', 'memoAdd', 'inquiryAdd', 'inquiryUpdate', 'msgRulesSave', 'ptSession', 'ptAssign', 'ptSetLeft', 'notionSync', 'passUpdate', 'paymentMethod', 'staffOrder', 'roleColor', 'taskSnooze'];
 
 export default async function handler(req, res) {
   cors(req, res);
