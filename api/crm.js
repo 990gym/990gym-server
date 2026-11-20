@@ -64,7 +64,7 @@ function liveStage(m, today, ss) {
   const absent0 = m.last_attended_on ? daysBetween(m.last_attended_on, today) : null;
   if (ss && ss.kind === '구독 중' || ss && ss.kind === '쉬어가기') { // 월구독은 만료 인원으로 안 센다
     if (!m.holding && ss.kind !== '쉬어가기' && (absent0 === null || absent0 >= 14) && !(started0 !== null && started0 < 14)) return '미출석';
-    if (started0 !== null && started0 <= 28) return '체험·신규';
+    if (started0 !== null && started0 <= 28) return '신규';
     return '정착';
   }
   if (ss && ss.kind === '결제 실패') return ss.end && daysBetween(ss.end, today) <= 14 ? '만료 예정' : '만료·이탈';
@@ -75,7 +75,7 @@ function liveStage(m, today, ss) {
   const started = m.first_started_on ? daysBetween(m.first_started_on, today) : null;
   const absent = m.last_attended_on ? daysBetween(m.last_attended_on, today) : null;
   if (!m.holding && (absent === null || absent >= 14) && !(started !== null && started < 14)) return '미출석';
-  if (started !== null && started <= 28) return '체험·신규';
+  if (started !== null && started <= 28) return '신규';
   return '정착';
 }
 
@@ -104,6 +104,14 @@ async function memo(key, ms, fn) {
 }
 const clearCache = () => CACHE.clear();
 
+// 체험권만 가진 회원은 '체험'으로 따로 (신규 = 정규 이용권으로 4주 안)
+const allPassesCached = () => memo('passes_all', 120000, () => selectAll(() => supabase.from('crm_passes').select('id,member_id,product_name,category,status,starts_on,ends_on,total_count,registered_on,price_paid').neq('status', '무효')));
+async function trialOnlySet() {
+  const ps = await allPassesCached();
+  const live = {}; ps.filter((p) => ['사용 중', '예정', '홀딩'].includes(p.status)).forEach((p) => { (live[p.member_id] = live[p.member_id] || []).push(p); });
+  return new Set(Object.entries(live).filter(([, l]) => l.every((p) => /체험|^PT ?3회$/.test(p.product_name || ''))).map(([k]) => k));
+}
+function markTrial(list, set) { list.forEach((m) => { if (m.stage !== '만료·이탈' && set.has(m.id)) m.stage = '체험'; }); return list; }
 function decorate(m0, today, subs) {
   const ss = subState(subOf(m0, subs), today, m0, subs);
   // 해지 신청·결제 실패한 구독은 결제된 날까지 쓴다 (그 날이 이미 지났으면 브로제이 기간을 본다)
@@ -201,9 +209,9 @@ function buildTasks(all, today, inGym, passByMember) {
         if (s >= 14 && s <= 30) out.push({ ...base, key: `nov:${m.id}:${m.first_started_on}`, kind: '미출석', stage: '미출석', tag: '첫 방문 없음',
           title: `등록 ${s}일째인데 한 번도 안 오셨어요`, sub: [prod(m), '방문 기록 없음'], action: '방문 날짜 잡기', group: '오늘 안에' });
       }
-    } else if (m.stage === '체험·신규' && m.first_started_on) {
+    } else if ((m.stage === '신규' || m.stage === '체험') && m.first_started_on) {
       const s = daysBetween(m.first_started_on, today);
-      if (s >= 3 && s <= 13 && (m.days_absent == null || m.days_absent >= 5)) out.push({ ...base, key: `new:${m.id}:${m.first_started_on}`, kind: '신규', stage: '체험·신규', tag: m.days_absent == null ? '첫 방문 없음' : '신규',
+      if (s >= 3 && s <= 13 && (m.days_absent == null || m.days_absent >= 5)) out.push({ ...base, key: `new:${m.id}:${m.first_started_on}`, kind: '신규', stage: m.stage, tag: m.days_absent == null ? '첫 방문 없음' : '신규',
         title: m.days_absent == null ? `등록 ${s}일째, 아직 첫 방문이 없어요` : `등록 ${s}일째인데 ${m.days_absent}일째 안 오세요`, sub: [prod(m), lastTxt(m)], action: m.days_absent == null ? '방문 날짜 잡기' : '안부 문자', group: '오늘 안에' });
     } else if (m.stage === '만료·이탈' && m.ends_on) {
       const e = daysBetween(m.ends_on, today);
@@ -252,9 +260,9 @@ async function dashboardRaw() {
   for (const r of [lockers, inq, totalCount, snap, staff]) if (r.error) throw r.error;
   const pays = await paymentsWithGroup(monthStartISO, Object.fromEntries(allPasses.map((p) => [p.id, p])));
 
-  const all = members.map((m) => decorate(m, today, subs));
+  const all = markTrial(members.map((m) => decorate(m, today, subs)), await trialOnlySet());
   const active = all.filter((m) => m.stage !== '만료·이탈');
-  const stages = { '체험·신규': 0, '정착': 0, '미출석': 0, '만료 예정': 0 };
+  const stages = { '체험': 0, '신규': 0, '정착': 0, '미출석': 0, '만료 예정': 0 };
   active.forEach((m) => { stages[m.stage] = (stages[m.stage] || 0) + 1; });
   const byId = Object.fromEntries(all.map((m) => [m.id, m]));
 
@@ -624,7 +632,7 @@ async function reportV2({ ym, week }) {
   const inR = (d, a, b) => d && d >= a && d <= b;
   const t12 = iso(Date.UTC(y, m - 12, 1));
   const [allPasses, pays, inqs, att, subs, members] = await Promise.all([
-    memo('passes_all', 120000, () => selectAll(() => supabase.from('crm_passes').select('id,member_id,product_name,category,status,starts_on,ends_on,total_count,registered_on,price_paid').neq('status', '무효'))),
+    allPassesCached(),
     paymentsWithGroup(kstStart(t12 < prevFrom ? t12 : prevFrom), {}, kstEndEx(to)),
     selectAll(() => supabase.from('crm_inquiries').select('id,name,phone,member_id,source,result,summary,raw_note,inquired_at').or(INQ_OK)),
     selectAll(() => supabase.from('crm_attendance').select('member_id,checked_at').gte('checked_at', kstStart(prevFrom)).lt('checked_at', kstEndEx(to))),
@@ -706,7 +714,7 @@ async function reportV2({ ym, week }) {
 const MSG_RULES = [
   { key: 'inq_price', stage: '유입', type: '자동 발송', title: '문의 즉시 가격 안내', body: '{이름}님, 990짐에 문의 주셔서 감사해요. 가격표와 시설 사진 → {링크}' },
   { key: 'inq_return', stage: '유입', type: '직원 할 일', title: '1차 리턴 (상담 3일 뒤)', body: '전화 → 안 받으면 문자' },
-  { key: 'welcome', stage: '체험·신규', type: '자동 발송', title: '신규 등록 환영 (등록 당일)', body: '{이름}님 990짐 회원이 되신 걸 환영해요. 첫 4주는 저희가 같이 챙겨드릴게요.' },
+  { key: 'welcome', stage: '신규', type: '자동 발송', title: '신규 등록 환영 (등록 당일)', body: '{이름}님 990짐 회원이 되신 걸 환영해요. 첫 4주는 저희가 같이 챙겨드릴게요.' },
   { key: 'absent14', stage: '미출석', type: '자동 + 할 일', title: '2주 안부 (14일 미출석)', body: '안부 문자 발송 → 3일 뒤에도 안 오면 직원 할 일 카드 생성' },
   { key: 'exp14', stage: '만료 예정', type: '자동 발송', title: '만료 2주 전 안내', body: '{이름}님 회원권이 {날짜}에 끝나요. 연장은 인포에서 도와드릴게요.' },
   { key: 'exp7', stage: '만료 예정', type: '자동 + 할 일', title: '만료 1주 전 안내', body: '안내 문자 발송 + 직원 할 일 등록 (재등록 직접 안내)' },
@@ -719,7 +727,7 @@ async function msgRules() {
   if (error) throw error;
   const on = (data && data.value) || {};
   const D = dash[1], t = D.tasks;
-  const cnt = { inq_price: D.totals.inquiries30, inq_return: t.filter((x) => x.kind === '유입').length, welcome: D.stages['체험·신규'], absent14: t.filter((x) => x.key.startsWith('abs14')).length,
+  const cnt = { inq_price: D.totals.inquiries30, inq_return: t.filter((x) => x.kind === '유입').length, welcome: D.stages['신규'], absent14: t.filter((x) => x.key.startsWith('abs14')).length,
     exp14: t.filter((x) => x.key.startsWith('exp')).length, exp7: t.filter((x) => x.key.startsWith('exp') && /D-[0-7]$|오늘/.test(x.tag)).length, payfail: D.totals.subFail, after1: t.filter((x) => x.key.startsWith('lapse')).length, after12: 0 };
   return [200, { rules: MSG_RULES.map((r) => ({ ...r, enabled: on[r.key] !== false, now: cnt[r.key] || 0 })), attendNotice: on.attend_notice || 'meaningful', connected: false }];
 }
@@ -1256,14 +1264,14 @@ async function members({ q = '', stage = '', limit = 60, offset = 0, sort = '', 
     supabase.from('crm_members').select('id', { count: 'exact', head: true }).eq('stage', '만료·이탈'),
   ]);
   if (error) throw error;
-  const all = data.map((m) => decorate(m, today, subs));
+  const all = markTrial(data.map((m) => decorate(m, today, subs)), await trialOnlySet());
   let rows = all;
   let counts = null;
   if (big) {
     const live = all.filter((m) => m.stage !== '만료·이탈');
     const isSub = (m) => m.sub === '구독 중' || m.sub === '쉬어가기';
     counts = { '': live.length, '월구독': live.filter(isSub).length, '홀딩': live.filter((m) => m.holding).length, '만료·이탈': (expiredDb.count || 0) + (all.length - live.length) };
-    ['체험·신규', '정착', '미출석', '만료 예정'].forEach((k) => { counts[k] = live.filter((m) => m.stage === k).length; });
+    ['체험', '신규', '정착', '미출석', '만료 예정'].forEach((k) => { counts[k] = live.filter((m) => m.stage === k).length; });
     if (stage === '월구독') rows = live.filter(isSub);
     else if (stage === '홀딩') rows = live.filter((m) => m.holding);
     else if (stage) rows = live.filter((m) => m.stage === stage);
@@ -1288,7 +1296,7 @@ async function members({ q = '', stage = '', limit = 60, offset = 0, sort = '', 
   }); });
   at.forEach((d) => d.forEach((a) => { visits[a.member_id] = (visits[a.member_id] || 0) + 1; }));
   let out = rows.map((m) => ({ ...m, pass_name: passName[m.id] ? passName[m.id].product_name : null, pt_name: ptName[m.id] || null, month_visits: visits[m.id] || 0, registered_on: [regOn[m.id], m.first_started_on].filter(Boolean).sort()[0] || null }));
-  const STAGE_ORDER = ['체험·신규', '정착', '미출석', '만료 예정', '만료·이탈'];
+  const STAGE_ORDER = ['체험', '신규', '정착', '미출석', '만료 예정', '만료·이탈'];
   const val = (m) => key === 'reg' ? m.registered_on : key === 'name' ? m.name : key === 'status' ? (m.holding ? 9 : STAGE_ORDER.indexOf(m.stage)) : key === 'pass' ? (m.pass_name || m.usage_tag || '') : key === 'left' ? (m.sub === '구독 중' || m.sub === '쉬어가기' ? 9999 : m.days_left) : key === 'visits' ? m.month_visits : m.days_absent;
   out.sort((a, b) => {
     const x = val(a), y = val(b);
@@ -1326,7 +1334,7 @@ async function member({ id }) {
   const S = await subsMap();
   const sb = subOf(safe, S);
   return [200, {
-    member: { ...decorate(safe, today, S), photo_url: await photoUrl(photo_path),
+    member: { ...markTrial([decorate(safe, today, S)], await trialOnlySet())[0], photo_url: await photoUrl(photo_path),
       subscription: sb ? { id: sb.id, name: sb.name, plan: sb.plan, status: sb.status, next_billing_date: sb.next_billing_date, phone4: digitsOf(sb.phone).slice(-4), linked: safe.subscriber_id === sb.id } : null },
     passes: passes.data, payments: payments.data,
     lockers: lockers.data.map(({ lock_code, ...l }) => l),
