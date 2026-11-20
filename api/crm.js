@@ -169,7 +169,7 @@ async function passesByIds(ids, known = {}) {
   return out;
 }
 async function paymentsWithGroup(fromISO, known, toISO) {
-  const pays = await selectAll(() => { let q = supabase.from('crm_payments').select('amount,paid_at,pass_id,member_id,kind').gte('paid_at', fromISO); if (toISO) q = q.lt('paid_at', toISO); return q; });
+  const pays = await selectAll(() => { let q = supabase.from('crm_payments').select('id,amount,paid_at,pass_id,member_id,kind,method').gte('paid_at', fromISO); if (toISO) q = q.lt('paid_at', toISO); return q; });
   const pm = await passesByIds(pays.map((p) => p.pass_id), known);
   return pays.map((p) => { const ps = pm[p.pass_id] || {}; return { ...p, day: kstDate(p.paid_at), group: salesGroup(ps.product_name, ps.category) }; });
 }
@@ -225,7 +225,7 @@ async function dashboardRaw() {
   const recentCut = new Date(Date.parse(today) - 400 * DAY).toISOString().slice(0, 10);
   const todayStartISO = new Date(Date.parse(`${today}T00:00:00+09:00`)).toISOString();
   const monthStartISO = new Date(Date.parse(`${month}-01T00:00:00+09:00`)).toISOString();
-  const [members, allPasses, _pays, lockers, assigns, inq, totalCount, snap, att, attPast, finance, staff, subs, doneRows] = await Promise.all([
+  const [members, allPasses, _pays, lockers, assigns, inq, totalCount, snap, att, attPast, finance, staff, subs, doneRows, smeta, sroles] = await Promise.all([
     Promise.all([
       selectAll(() => supabase.from('crm_members').select(MEMBER_COLS).neq('stage', '만료·이탈')),
       selectAll(() => supabase.from('crm_members').select(MEMBER_COLS).eq('stage', '만료·이탈').gte('ends_on', recentCut)),
@@ -238,7 +238,7 @@ async function dashboardRaw() {
     null,
     supabase.from('crm_lockers').select('number'),
     selectAll(() => supabase.from('crm_locker_assignments').select('locker_no,member_id,status,ends_on').in('status', ['사용 중', '예정', '홀딩'])),
-    supabase.from('crm_inquiries').select('id,name,phone,source,summary,staff_name,return_on,result,inquired_at,member_id').gte('inquired_at', new Date(Date.parse(today) - 30 * DAY).toISOString()),
+    supabase.from('crm_inquiries').select('id,name,phone,source,summary,staff_name,return_on,result,inquired_at,member_id').or(INQ_OK).gte('inquired_at', new Date(Date.parse(today) - 30 * DAY).toISOString()),
     supabase.from('crm_members').select('id', { count: 'exact', head: true }),
     supabase.from('crm_members').select('created_at').order('created_at', { ascending: false }).limit(1),
     selectAll(() => supabase.from('crm_attendance').select('member_id,checked_at').gte('checked_at', todayStartISO)),
@@ -247,6 +247,7 @@ async function dashboardRaw() {
     supabase.from('crm_staff').select('id,name,role').eq('active', true).order('created_at'),
     subsMap(),
     selectAll(() => supabase.from('crm_tasks').select('task_key,done_by,done_at,kind').gte('done_at', monthStartISO)),
+    staffMeta(), getRoles(),
   ]);
   for (const r of [lockers, inq, totalCount, snap, staff]) if (r.error) throw r.error;
   const pays = await paymentsWithGroup(monthStartISO, Object.fromEntries(allPasses.map((p) => [p.id, p])));
@@ -344,7 +345,8 @@ async function dashboardRaw() {
     attendance: { now: Object.keys(inGym).length, today: seenToday.size, hours, usual: usual.map((v) => Math.round((v / nUsual) * 10) / 10), hasUsual: usualDays.size > 0 },
     sales: { month, days, byGroup: sales, membership, pt: sales.PT, total: membership + sales.PT, daily, target: finance.target, breakeven: finance.breakeven, floor: finance.floor, ptPay: finance.ptPay, profit: finance.profit },
     tasks: list, doneToday: doneToday.length,
-    staff: (staff.data || []).map((s) => ({ ...s, ...(staffStats[s.name] || { today: 0, month: 0 }) })),
+    staff: sortStaff(staff.data || [], smeta.order).map((s) => ({ ...s, ...(staffStats[s.name] || { today: 0, month: 0 }) })),
+    roleColors: roleColorsOf(sroles, smeta.colors),
   }];
 }
 
@@ -391,10 +393,13 @@ async function inquiryAdd({ name, phone, source, staff, note, reason, interest, 
   if (error) throw error;
   return [200, { success: true, id: data && data.id, existing, return_on: ret }];
 }
-async function inquiryList({ days = 60 }) {
-  const { data, error } = await supabase.from('crm_inquiries').select('id,legacy_id,name,phone,source,raw_note,summary,staff_name,return_on,result,member_id,inquired_at').gte('inquired_at', new Date(Date.now() - Math.min(365, Number(days) || 60) * DAY).toISOString()).order('inquired_at', { ascending: false }).limit(200);
-  if (error) throw error;
-  return [200, { inquiries: data.map((q) => ({ ...q, ...parseInqSummary(q.summary), from_notion: String(q.legacy_id || '').startsWith('notion:'), legacy_id: undefined, summary: undefined })), sources: INQ_SOURCES, sync: await syncStatus() }];
+const INQ_OK = 'legacy_id.is.null,legacy_id.like.notion:*';
+async function inquiryList() {
+  const [data, sync] = await Promise.all([
+    selectAll(() => supabase.from('crm_inquiries').select('id,legacy_id,name,phone,source,raw_note,summary,staff_name,return_on,result,member_id,inquired_at').or(INQ_OK).order('inquired_at', { ascending: false })),
+    syncStatus(),
+  ]);
+  return [200, { today: todayKST(), inquiries: data.map((q) => ({ ...q, ...parseInqSummary(q.summary), raw_note: q.raw_note ? q.raw_note.slice(0, 600) : null, from_notion: String(q.legacy_id || '').startsWith('notion:'), legacy_id: undefined, summary: undefined })), sources: INQ_SOURCES, sync }];
 }
 async function inquiryUpdate({ id, result, reason, return_on }) {
   if (!id) return [400, { error: '필수 정보 누락' }];
@@ -455,12 +460,15 @@ async function ptBoard({ period = 'month' }) {
     selectAll(() => supabase.from('crm_pt_notion_log').select('notion_id,trainer,member_id,delta,day').gte('day', from).lte('day', to)),
   ]);
   const source = nrows.length ? 'notion' : 'broj';
+  let stale = 0;
   if (nrows.length) {
     const miss = [...new Set(nrows.map((n) => n.member_id).filter((id) => id && !names[id]))];
     for (let i = 0; i < miss.length; i += 150) { const { data } = await supabase.from('crm_members').select('id,name,phone,last_attended_on,trainer').in('id', miss.slice(i, i + 150)); (data || []).forEach((m) => { names[m.id] = m; }); }
     const passOf = {}; live.forEach((p) => { if (!passOf[p.member_id] || String(p.ends_on) > String(passOf[p.member_id].ends_on)) passOf[p.member_id] = p; });
     rows.length = 0;
-    nrows.filter((n) => n.status !== '완료').forEach((n) => {
+    const staleBefore = Date.now() - 90 * DAY;
+    stale = nrows.filter((n) => n.status !== '완료' && n.notion_edited_at && Date.parse(n.notion_edited_at) < staleBefore).length;
+    nrows.filter((n) => n.status !== '완료' && !(n.notion_edited_at && Date.parse(n.notion_edited_at) < staleBefore)).forEach((n) => {
       const p = passOf[n.member_id] || null, m = names[n.member_id] || {};
       const total = n.total || 0, used = n.used || 0, left = n.remaining != null ? n.remaining : Math.max(0, total - used);
       const u = p ? unit(p) : 0, dl = p && p.ends_on ? daysBetween(today, p.ends_on) : null;
@@ -493,7 +501,7 @@ async function ptBoard({ period = 'month' }) {
   rows.filter((r) => r.state === '곧 끝남').slice(0, 3).forEach((r) => watch.push({ ...r, kind: '곧 끝남', title: `${r.left}회 남았어요 · 재등록 상담 타이밍`, sub: `${r.total}회 중 ${r.used}회 진행`, action: r.trainer === '미지정' ? '재등록 상담 문구 복사' : `${r.trainer}쌤에게 재등록 상담 요청` }));
   rows.filter((r) => /^기간/.test(r.state)).slice(0, 3).forEach((r) => watch.push({ ...r, kind: '기간 임박', title: `${r.left}회 남았는데 기간은 ${r.days_left}일 남았어요`, sub: `남은 금액 ${r.left_amount.toLocaleString('ko-KR')}원 · 연장할지 몰아서 할지 정해야 해요`, action: '남은 횟수 안내 문자' }));
   const sync = await syncStatus();
-  return [200, { today, period, from, to, source, sync, unmatched: rows.filter((r) => r.matched && r.matched !== '자동').length,
+  return [200, { today, period, from, to, source, sync, stale, unmatched: rows.filter((r) => r.matched && r.matched !== '자동').length,
     registered: { members: new Set(newOnes.map((p) => p.member_id)).size, sessions: newOnes.reduce((a, p) => a + (p.total_count || 0), 0), amount: newOnes.reduce((a, p) => a + (p.price_paid || 0), 0) },
     remaining: { sessions: leftTotal, amount: rows.reduce((a, r) => a + r.left_amount, 0), months: sess.length >= 20 ? Math.round(leftTotal / (sess.length / Math.max(1, Math.round((Date.parse([to, today].sort()[0]) - Date.parse(from)) / DAY) + 1) * 30) * 10) / 10 : null },
     used: { sessions: sess.length, amount: sess.reduce((a, x) => a + (x.unit_price || 0), 0), perDay: Math.round(sess.length / Math.max(1, Math.round((Date.parse([to, today].sort()[0]) - Date.parse(from)) / DAY) + 1) * 10) / 10, daily: dailySess, lifetime: rows.reduce((a, r) => a + r.used, 0) },
@@ -548,7 +556,7 @@ async function revenue({ period = 'month' }) {
     paymentsWithGroup(kstStart(from), {}, kstEndEx(to)),
     getFinance(),
     supabase.from('subscribers').select('name,plan,status,next_billing_date'),
-    supabase.from('crm_payments').select('amount,paid_at,pass_id,member_id,kind').order('paid_at', { ascending: false }).limit(8),
+    supabase.from('crm_payments').select('id,amount,paid_at,pass_id,member_id,kind,method').order('paid_at', { ascending: false }).limit(8),
   ]);
   if (subs.error || recent.error) throw subs.error || recent.error;
   const total = pays.reduce((a, p) => a + p.amount, 0);
@@ -563,9 +571,12 @@ async function revenue({ period = 'month' }) {
   const mids = [...new Set(pick.map((p) => p.member_id))];
   const nm = {};
   if (mids.length) { const { data, error } = await supabase.from('crm_members').select('id,name').in('id', mids); if (error) throw error; data.forEach((m) => { nm[m.id] = m.name; }); }
-  const list = pick.map((p) => ({ name: nm[p.member_id] || '-', member_id: p.member_id, amount: p.amount, kind: p.kind, product: (pm[p.pass_id] || {}).product_name || '-', group: salesGroup((pm[p.pass_id] || {}).product_name, (pm[p.pass_id] || {}).category), at: p.paid_at }));
+  const list = pick.map((p) => ({ id: p.id, method: p.method || null, name: nm[p.member_id] || '-', member_id: p.member_id, amount: p.amount, kind: p.kind, product: (pm[p.pass_id] || {}).product_name || '-', group: salesGroup((pm[p.pass_id] || {}).product_name, (pm[p.pass_id] || {}).category), at: p.paid_at }));
   const days = Math.round((Date.parse(to) - Date.parse(from)) / DAY) + 1;
-  return [200, { period, label, from, to, today, days, total, count: pays.length, groups, daily, goal: period === 'today' ? Math.round(finance.target / 30) : finance.target,
+  // 결제 방법 (월구독은 토스 자동결제라 뺀다)
+  const methods = {}; PAY_METHODS.concat(['미입력']).forEach((k) => { methods[k] = { amount: 0, count: 0 }; });
+  pays.filter((p) => p.group !== '월구독').forEach((p) => { const k = PAY_METHODS.includes(p.method) ? p.method : '미입력'; methods[k].amount += p.amount; methods[k].count++; });
+  return [200, { period, label, from, to, today, days, total, count: pays.length, groups, daily, methods, goal: period === 'today' ? Math.round(finance.target / 30) : finance.target,
     dailyGoal: Math.round(finance.target / 30), lastPayDay: pays.reduce((a, p) => (p.day > a ? p.day : a), '') || null,
     unpaid: { count: fails.length, amount: fails.reduce((a, x) => a + (PLAN_PRICE[x.plan] || 39000), 0) },
     routes: { 토스자동결제: { amount: groups.월구독, count: pays.filter((p) => p.group === '월구독').length }, 인포결제: { amount: total - groups.월구독, count: pays.filter((p) => p.group !== '월구독').length } },
@@ -653,12 +664,11 @@ function returnOn(inquiredDay, today) {
   return past.length ? past[past.length - 1] : ms[0];
 }
 async function syncWalkins(today, phoneToMember) {
-  const since = new Date(Date.parse(today) - 120 * DAY).toISOString().slice(0, 10);
-  const pages = await notionQueryAll(NOTION_WALKIN_DB, { filter: { property: '유입날짜', date: { on_or_after: since } } });
+  const pages = await notionQueryAll(NOTION_WALKIN_DB, { sorts: [{ timestamp: 'created_time', direction: 'descending' }] });
   // CRM에서 이미 결과(등록/미등록)를 남긴 건 노션이 비어 있으면 그대로 둔다
   const ex = {};
   (await selectAll(() => supabase.from('crm_inquiries').select('legacy_id,result,member_id').like('legacy_id', 'notion:%'))).forEach((r) => { ex[r.legacy_id] = r; });
-  let n = 0;
+  let n = 0; const out = [];
   for (const pg of pages) {
     const P = pg.properties || {};
     const name = nv.text(P['고객명']); if (!name) continue;
@@ -671,16 +681,16 @@ async function syncWalkins(today, phoneToMember) {
     const row = { legacy_id: `notion:${pg.id}`, name: name.slice(0, 30), phone, source: srcRaw ? (SRC_MAP[srcRaw] || srcRaw) : null,
       raw_note: [nv.text(P['메모']), nv.text(P['특이사항'])].filter(Boolean).join(' / ').slice(0, 2000) || null, summary,
       staff_name: (nv.text(P['FC']) || nv.sel(P['담당쌤']) || '').slice(0, 20) || null,
-      return_on: result === '등록' || result === '미등록' ? null : returnOn(day, today),
+      return_on: result === '등록' || result === '미등록' || daysBetween(day.slice(0, 10), today) > 35 ? null : returnOn(day.slice(0, 10), today),
       result: result === '상담 중' ? null : result, member_id: phone && phoneToMember[phone] ? phoneToMember[phone] : null,
       inquired_at: new Date(Date.parse(`${day.slice(0, 10)}T12:00:00+09:00`)).toISOString() };
     const old = ex[row.legacy_id];
     if (old && old.result && !row.result) { row.result = old.result; row.return_on = null; }
     if (old && old.member_id && !row.member_id) row.member_id = old.member_id;
-    const { error } = await supabase.from('crm_inquiries').upsert(row, { onConflict: 'legacy_id' });
-    if (error) throw error;
+    out.push(row);
     n++;
   }
+  for (let i = 0; i < out.length; i += 200) { const { error } = await supabase.from('crm_inquiries').upsert(out.slice(i, i + 200), { onConflict: 'legacy_id' }); if (error) throw error; }
   return n;
 }
 async function findPtDatabases() {
@@ -689,7 +699,7 @@ async function findPtDatabases() {
     if (depth > 7) return;
     for (const b of await notionChildren(id)) {
       if (b.type === 'child_page' && !trainer) await walk(b.id, b.child_page.title.replace(/트레이너|선생님|쌤/g, '').replace(/[^\p{L}\p{N}]/gu, '').trim() || trainer, depth + 1);
-      else if (b.type === 'child_database' && /^회원 ?목록$/.test((b.child_database.title || '').trim()) && trainer) found.push({ id: b.id, trainer });
+      else if (b.type === 'child_database' && /회원 ?목록/.test((b.child_database.title || '').trim()) && !/만료/.test(b.child_database.title || '') && trainer) found.push({ id: b.id, trainer });
       else if (b.has_children && ['column_list', 'column', 'toggle', 'synced_block'].includes(b.type)) await walk(b.id, trainer, depth + 1);
     }
   };
@@ -701,9 +711,10 @@ async function syncPT(today, members, ptMemberIds) {
   const prev = Object.fromEntries((await selectAll(() => supabase.from('crm_pt_notion').select('notion_id,used'))).map((r) => [r.notion_id, r.used]));
   const byName = {};
   members.forEach((m) => { const k = String(m.name || '').replace(/\s/g, ''); (byName[k] = byName[k] || []).push(m.id); });
-  let n = 0; const logs = [];
-  for (const db of dbs) {
-    for (const pg of await notionQueryAll(db.id)) {
+  let n = 0; const logs = []; const out = [];
+  const lists = await Promise.all(dbs.map((db) => notionQueryAll(db.id)));
+  for (const [di, db] of dbs.entries()) {
+    for (const pg of lists[di]) {
       const P = pg.properties || {};
       const name = nv.text(P['이름']).replace(/\(.*?\)/g, '').trim(); if (!name) continue;
       const total = nv.num(P['전체세션']), used = nv.num(P['진행세션']);
@@ -713,13 +724,13 @@ async function syncPT(today, members, ptMemberIds) {
       const row = { notion_id: pg.id, trainer: db.trainer, name: name.slice(0, 30), status: nv.sel(P['상태']) || null, total: total == null ? null : Math.round(total), used: used == null ? null : Math.round(used),
         remaining: total != null && used != null ? Math.round(total - used) : null, member_id: pick, matched: pick ? '자동' : cands.length > 1 ? '확인 필요' : '없음',
         purpose: nv.multi(P['운동목적']).join(', ') || null, note: nv.text(P['비고']).slice(0, 300) || null, notion_edited_at: pg.last_edited_time, synced_at: new Date().toISOString() };
-      const { error } = await supabase.from('crm_pt_notion').upsert(row, { onConflict: 'notion_id' });
-      if (error) throw error;
+      out.push(row);
       const before = prev[pg.id];
       if (row.used != null && before != null && row.used !== before) logs.push({ notion_id: pg.id, trainer: db.trainer, member_id: pick, delta: row.used - before, used_after: row.used, day: kstDate(pg.last_edited_time) });
       n++;
     }
   }
+  for (let i = 0; i < out.length; i += 200) { const { error } = await supabase.from('crm_pt_notion').upsert(out.slice(i, i + 200), { onConflict: 'notion_id' }); if (error) throw error; }
   if (logs.length) { const { error } = await supabase.from('crm_pt_notion_log').insert(logs); if (error) throw error; }
   return { members: n, trainers: dbs.map((d) => d.trainer), sessionsLogged: logs.reduce((a, l) => a + l.delta, 0) };
 }
@@ -741,12 +752,77 @@ async function notionSync({ force } = {}) {
   const phoneToMember = {}; members.forEach((m) => { if (m.phone) phoneToMember[m.phone] = m.id; });
   const ptIds = new Set(ptPasses.filter((p) => salesGroup(p.product_name, p.category) === 'PT').map((p) => p.member_id));
   const out = { at: new Date().toISOString() };
-  try { out.walkins = await syncWalkins(today, phoneToMember); } catch (e) { out.walkinError = e.code === 'object_not_found' || e.status === 404 ? '워크인 로그가 990crm 연결에 공유되지 않았어요' : e.message; }
-  try { out.pt = await syncPT(today, members, ptIds); } catch (e) { out.ptError = e.code === 'object_not_found' || e.status === 404 ? 'PT회원관리가 990crm 연결에 공유되지 않았어요' : e.message; }
+  await Promise.all([
+    syncWalkins(today, phoneToMember).then((v) => { out.walkins = v; }, (e) => { out.walkinError = e.code === 'object_not_found' || e.status === 404 ? '워크인 로그가 990crm 연결에 공유되지 않았어요' : e.message; }),
+    syncPT(today, members, ptIds).then((v) => { out.pt = v; }, (e) => { out.ptError = e.code === 'object_not_found' || e.status === 404 ? 'PT회원관리가 990crm 연결에 공유되지 않았어요' : e.message; }),
+  ]);
   const { error } = await supabase.from('crm_settings').upsert({ key: 'notion_sync', value: out, updated_at: new Date().toISOString() }, { onConflict: 'key' });
   if (error) throw error;
   clearCache();
   return [200, { connected: true, ...out }];
+}
+
+// ---------- 이용권 수정 · 결제 방법 ----------
+const PAY_METHODS = ['카드', '현금', '계좌이체'];
+const PASS_STATUS = ['사용 중', '예정', '홀딩', '만료', '무효'];
+const isDate = (v) => /^\d{4}-\d{2}-\d{2}$/.test(String(v || ''));
+async function passUpdate({ id, product_name, status, starts_on, ends_on, total_count, remaining_count, price_paid, method, staff }) {
+  if (!id) return [400, { error: '필수 정보 누락' }];
+  const cur = await supabase.from('crm_passes').select('*').eq('id', id).maybeSingle();
+  if (cur.error) throw cur.error;
+  if (!cur.data) return [404, { error: '이용권을 찾을 수 없어요' }];
+  const p = { ...cur.data }, patch = {};
+  const intOrNull = (v) => (v === '' || v == null ? null : Math.max(0, Math.round(Number(v))));
+  if (product_name != null && String(product_name).trim()) patch.product_name = String(product_name).trim().slice(0, 60);
+  if (status != null) { if (!PASS_STATUS.includes(status)) return [400, { error: '상태를 다시 골라주세요' }]; patch.status = status; }
+  if (starts_on !== undefined) { if (starts_on && !isDate(starts_on)) return [400, { error: '시작일을 다시 확인해주세요' }]; patch.starts_on = starts_on || null; }
+  if (ends_on !== undefined) { if (ends_on && !isDate(ends_on)) return [400, { error: '만료일을 다시 확인해주세요' }]; patch.ends_on = ends_on || null; }
+  const s0 = patch.starts_on !== undefined ? patch.starts_on : p.starts_on, e0 = patch.ends_on !== undefined ? patch.ends_on : p.ends_on;
+  if (s0 && e0 && e0 < s0) return [400, { error: '만료일이 시작일보다 빨라요' }];
+  if (total_count !== undefined) patch.total_count = intOrNull(total_count);
+  if (remaining_count !== undefined) patch.remaining_count = intOrNull(remaining_count);
+  const t0 = patch.total_count !== undefined ? patch.total_count : p.total_count, r0 = patch.remaining_count !== undefined ? patch.remaining_count : p.remaining_count;
+  if (t0 != null && r0 != null && r0 > t0) return [400, { error: '남은 횟수가 전체 횟수보다 많아요' }];
+  if (price_paid !== undefined) patch.price_paid = intOrNull(price_paid) || 0;
+  const LABEL = { product_name: '상품명', status: '상태', starts_on: '시작일', ends_on: '만료일', total_count: '전체 횟수', remaining_count: '남은 횟수', price_paid: '결제 금액' };
+  const changes = Object.keys(patch).filter((k) => String(patch[k] ?? '') !== String(p[k] ?? ''));
+  if (changes.length) {
+    const upd = {}; changes.forEach((k) => { upd[k] = patch[k]; });
+    const { error } = await supabase.from('crm_passes').update(upd).eq('id', id);
+    if (error) throw error;
+  }
+  let methodNote = '';
+  if (method !== undefined && method !== null) {
+    if (method && !PAY_METHODS.includes(method)) return [400, { error: '결제 방법을 다시 골라주세요' }];
+    const { error } = await supabase.from('crm_payments').update({ method: method || null }).eq('pass_id', id);
+    if (error) throw error;
+    methodNote = method ? `결제 방법 ${method}` : '';
+  }
+  // 회원의 만료일·단계도 맞춘다 (PT 제외, 쓰는 중인 이용권 중 가장 늦은 만료일)
+  if (changes.some((k) => ['status', 'ends_on', 'product_name'].includes(k))) {
+    const [{ data: ps, error: e1 }, { data: m, error: e2 }] = await Promise.all([
+      supabase.from('crm_passes').select('product_name,category,status,ends_on').eq('member_id', p.member_id),
+      supabase.from('crm_members').select('ends_on,stage').eq('id', p.member_id).maybeSingle(),
+    ]);
+    if (e1 || e2) throw e1 || e2;
+    const ends = ps.filter((x) => ['사용 중', '예정', '홀딩'].includes(x.status) && salesGroup(x.product_name, x.category) !== 'PT' && x.ends_on).map((x) => x.ends_on).sort();
+    const newEnd = ends.length ? ends[ends.length - 1] : null;
+    const today = todayKST();
+    const mp = {};
+    if (newEnd && newEnd !== (m && m.ends_on)) mp.ends_on = newEnd;
+    if (m && m.stage === '만료·이탈' && newEnd && newEnd >= today) mp.stage = '정착';
+    if (Object.keys(mp).length) { const { error } = await supabase.from('crm_members').update(mp).eq('id', p.member_id); if (error) throw error; }
+  }
+  const body = changes.map((k) => `${LABEL[k]} ${p[k] ?? '-'} → ${patch[k] ?? '-'}`).concat(methodNote ? [methodNote] : []).join(', ');
+  if (body) await supabase.from('crm_events').insert({ member_id: p.member_id, kind: '이용권 수정', body: `${p.product_name} · ${body}`.slice(0, 500), staff_name: staff ? String(staff).slice(0, 20) : null });
+  return member({ id: p.member_id });
+}
+async function paymentMethod({ id, method }) {
+  if (!id) return [400, { error: '필수 정보 누락' }];
+  if (method && !PAY_METHODS.includes(method)) return [400, { error: '결제 방법을 다시 골라주세요' }];
+  const { error } = await supabase.from('crm_payments').update({ method: method || null }).eq('id', id);
+  if (error) throw error;
+  return [200, { ok: true }];
 }
 
 // ---------- 메모 ----------
@@ -787,10 +863,33 @@ async function getRoles() {
   const list = data && Array.isArray(data.value) ? data.value : DEFAULT_ROLES;
   return list.map((r) => String(r).trim().slice(0, 20)).filter(Boolean);
 }
-async function staffList() {
-  const [{ data, error }, roles] = await Promise.all([supabase.from('crm_staff').select('id,name,role,active').eq('active', true).order('created_at'), getRoles()]);
+// 직원 순서·직책 색은 설정에 저장 (staff_order: [id...], role_colors: {직책: 색 이름})
+const ROLE_COLORS = ['파랑', '남색', '빨강', '하늘', '초록', '주황', '보라', '회색'];
+async function staffMeta() {
+  const { data, error } = await supabase.from('crm_settings').select('key,value').in('key', ['staff_order', 'role_colors']);
   if (error) throw error;
-  return [200, { staff: data, roles }];
+  const v = Object.fromEntries((data || []).map((x) => [x.key, x.value]));
+  return { order: Array.isArray(v.staff_order) ? v.staff_order : [], colors: v.role_colors && typeof v.role_colors === 'object' ? v.role_colors : {} };
+}
+const sortStaff = (list, order) => list.slice().sort((a, b) => { const x = order.indexOf(a.id), y = order.indexOf(b.id); return (x < 0 ? 1e9 : x) - (y < 0 ? 1e9 : y); });
+const roleColorsOf = (roles, colors) => Object.fromEntries(roles.map((r, i) => [r, ROLE_COLORS.includes(colors[r]) ? colors[r] : ROLE_COLORS[i % ROLE_COLORS.length]]));
+async function staffList() {
+  const [{ data, error }, roles, meta] = await Promise.all([supabase.from('crm_staff').select('id,name,role,active').eq('active', true).order('created_at'), getRoles(), staffMeta()]);
+  if (error) throw error;
+  return [200, { staff: sortStaff(data, meta.order), roles, roleColors: roleColorsOf(roles, meta.colors), colorNames: ROLE_COLORS }];
+}
+async function staffOrder({ ids }) {
+  if (!Array.isArray(ids) || ids.length > 100) return [400, { error: '순서가 맞지 않아요' }];
+  const { error } = await supabase.from('crm_settings').upsert({ key: 'staff_order', value: ids.map(String).slice(0, 100), updated_at: new Date().toISOString() }, { onConflict: 'key' });
+  if (error) throw error;
+  return staffList();
+}
+async function roleColor({ role, color }) {
+  if (!role || !ROLE_COLORS.includes(color)) return [400, { error: '색을 다시 골라주세요' }];
+  const meta = await staffMeta();
+  const { error } = await supabase.from('crm_settings').upsert({ key: 'role_colors', value: { ...meta.colors, [String(role).slice(0, 20)]: color }, updated_at: new Date().toISOString() }, { onConflict: 'key' });
+  if (error) throw error;
+  return staffList();
 }
 const cleanRole = (role, roles) => (role && roles.includes(String(role).trim()) ? String(role).trim() : null);
 async function staffAdd({ name, role }) {
@@ -871,10 +970,10 @@ async function report({ period = 'month' }) {
     selectAll(() => supabase.from('crm_passes').select('id,member_id,category,product_name,status,starts_on,ends_on').gte('ends_on', new Date(Date.parse(P.prevFrom) - 400 * DAY).toISOString().slice(0, 10))),
     selectAll(() => supabase.from('crm_attendance').select('member_id,checked_at').gte('checked_at', kstStart(P.prevFrom)).lt('checked_at', kstEndEx(P.to))),
     selectAll(() => supabase.from('crm_tasks').select('kind,done_by,done_at').gte('done_at', kstStart(P.prevFrom)).lt('done_at', kstEndEx(P.to))),
-    supabase.from('crm_inquiries').select('inquired_at').gte('inquired_at', kstStart(P.prevFrom)).lt('inquired_at', kstEndEx(P.to)),
+    supabase.from('crm_inquiries').select('inquired_at').or(INQ_OK).gte('inquired_at', kstStart(P.prevFrom)).lt('inquired_at', kstEndEx(P.to)),
     supabase.from('subscribers').select('created_at,cancelled_at,status,churn_reason'),
     getFinance(),
-    supabase.from('crm_inquiries').select('source,result,member_id,summary,inquired_at').gte('inquired_at', kstStart(P.from)).lt('inquired_at', kstEndEx(P.to)),
+    supabase.from('crm_inquiries').select('source,result,member_id,summary,inquired_at').or(INQ_OK).gte('inquired_at', kstStart(P.from)).lt('inquired_at', kstEndEx(P.to)),
     supabase.from('crm_pnl_monthly').select('ym,revenue').order('ym'),
   ]);
   if (inqAll.error || pnl.error) throw inqAll.error || pnl.error;
@@ -919,13 +1018,35 @@ async function report({ period = 'month' }) {
   // ── 시안 보고서용 ──
   // 깔때기: 유입(문의) → 체험(체험권 결제) → 정규 등록(신규 결제) → 재등록
   const inP = (d) => d >= P.from && d <= P.to;
-  const trialM = new Set(), regM = new Set();
+  const trialM = new Set(), regM = new Set(), regDay = {}, regSub = {};
   const passById = Object.fromEntries(passes.map((x) => [x.id, x]));
   pays.filter((p) => inP(p.day)).forEach((p) => {
     const nm = (passById[p.pass_id] || {}).product_name || '';
-    if (/체험|^PT ?3회$/.test(nm)) trialM.add(p.member_id); else if (p.kind === '신규') regM.add(p.member_id);
+    if (/체험|^PT ?3회$/.test(nm)) trialM.add(p.member_id);
+    else if (p.kind === '신규' && p.group !== 'PT') { // 정규 등록 = 회원권(헬스·GX·월구독) 신규. PT만 산 건 PT 화면에서 본다
+      regM.add(p.member_id);
+      if (!regDay[p.member_id] || p.day < regDay[p.member_id]) { regDay[p.member_id] = p.day; regSub[p.member_id] = p.group === '월구독'; }
+    }
   });
-  const funnel = { inquiries: inqAll.data.length, trial: trialM.size, regular: regM.size, regularFromTrial: [...regM].filter((m) => trialM.has(m)).length, renewed: cur.renewed, ended: cur.ended };
+  // 정규 등록한 사람이 어디서 왔나: 이 기간 문의 / 그 전 문의 / 문의 기록 없음(홈페이지 월구독 가입 따로)
+  const regIds = [...regM];
+  const [allInq, regPeople] = await Promise.all([
+    selectAll(() => supabase.from('crm_inquiries').select('member_id,phone,inquired_at').or(INQ_OK)),
+    regIds.length ? supabase.from('crm_members').select('id,phone').in('id', regIds) : Promise.resolve({ data: [] }),
+  ]);
+  const phoneOf = Object.fromEntries((regPeople.data || []).map((m) => [m.id, m.phone]));
+  const origin = { thisPeriod: 0, earlier: 0, online: 0, none: 0 }, lag = [];
+  regIds.forEach((mid) => {
+    const ph = phoneOf[mid], rd = regDay[mid];
+    const qs = allInq.filter((q) => (q.member_id === mid || (ph && q.phone === ph)) && kstDate(q.inquired_at) <= new Date(Date.parse(rd) + DAY).toISOString().slice(0, 10)).map((q) => kstDate(q.inquired_at)).sort();
+    const last = qs[qs.length - 1];
+    if (last && last >= P.from) origin.thisPeriod++;
+    else if (last) { origin.earlier++; lag.push(daysBetween(last, rd)); }
+    else if (regSub[mid]) origin.online++;
+    else origin.none++;
+  });
+  const funnel = { inquiries: inqAll.data.length, trial: trialM.size, regular: regM.size, regularFromTrial: regIds.filter((m) => trialM.has(m)).length, renewed: cur.renewed, ended: cur.ended,
+    origin, earlierLag: lag.length ? Math.round(lag.reduce((a, b) => a + b, 0) / lag.length) : null };
   // 유입 경로별 문의 수 · 등록 비율
   const src = {};
   inqAll.data.forEach((q) => { const k = q.source || '기록 없음'; const o = (src[k] = src[k] || { source: k, count: 0, joined: 0 }); o.count++; if (q.result === '등록' || q.member_id) o.joined++; });
@@ -984,9 +1105,14 @@ async function salesYear({ year }) {
 }
 
 // ---------- 회원 목록·검색 ----------
-async function members({ q = '', stage = '', limit = 60, offset = 0 }) {
+const SORTS = ['reg', 'name', 'status', 'pass', 'left', 'visits', 'last'];
+const DB_SORT = { reg: 'first_started_on', name: 'name', left: 'ends_on', last: 'last_attended_on' };
+async function members({ q = '', stage = '', limit = 60, offset = 0, sort = '', dir = '' }) {
   const today = todayKST();
   const term = String(q).trim().slice(0, 30);
+  // 기본: 유효 회원은 최근 등록한 순, 만료·이탈은 최근 만료 순
+  const key = SORTS.includes(sort) ? sort : stage === '만료·이탈' ? 'left' : 'reg';
+  const asc = dir === 'asc' ? true : dir === 'desc' ? false : key === 'name' || (key === 'left' && stage !== '만료·이탈');
   let query = supabase.from('crm_members').select(MEMBER_COLS, { count: 'exact' });
   if (term) {
     const digits = term.replace(/\D/g, '');
@@ -998,8 +1124,8 @@ async function members({ q = '', stage = '', limit = 60, offset = 0 }) {
   } else {
     query = query.neq('stage', '만료·이탈');
   }
-  query = query.order('ends_on', { ascending: true, nullsFirst: false });
-  // 단계는 오늘 기준으로 다시 계산하므로 유효 회원은 전부 받아서 거른다 (최대 수백 명)
+  query = query.order(DB_SORT[key] || 'ends_on', { ascending: key === 'last' ? !asc : asc, nullsFirst: false });
+  // 단계는 오늘 기준으로 다시 계산하므로 유효 회원은 전부 받아서 거르고 정렬한다 (최대 수백 명)
   const big = !term && stage !== '만료·이탈';
   const [{ data, error, count }, subs, expiredDb] = await Promise.all([
     big ? query.range(0, 999) : query.range(offset, offset + Math.min(limit, 100) - 1), subsMap(),
@@ -1019,24 +1145,34 @@ async function members({ q = '', stage = '', limit = 60, offset = 0 }) {
     else if (stage) rows = live.filter((m) => m.stage === stage);
     else rows = live;
   }
-  const page = big ? rows.slice(offset, offset + Math.min(limit, 100)) : rows;
-  // 표에 보일 이용권 이름과 이번 달 출석 횟수
-  const ids = page.map((m) => m.id);
+  // 표에 보일 이용권 이름·최근 등록일·이번 달 출석 횟수 (유효 회원은 정렬 때문에 전부 계산)
+  const ids = rows.map((m) => m.id);
   const monthStart = new Date(Date.parse(`${today.slice(0, 7)}-01T00:00:00+09:00`)).toISOString();
-  const chunks = []; for (let i = 0; i < ids.length; i += 100) chunks.push(ids.slice(i, i + 100));
+  const chunks = []; for (let i = 0; i < ids.length; i += 150) chunks.push(ids.slice(i, i + 150));
   const [ps, at] = await Promise.all([
-    Promise.all(chunks.map((c) => supabase.from('crm_passes').select('member_id,product_name,category,ends_on').in('member_id', c).in('status', ['사용 중', '예정', '홀딩']))),
-    Promise.all(chunks.map((c) => supabase.from('crm_attendance').select('member_id').in('member_id', c).gte('checked_at', monthStart))),
+    Promise.all(chunks.map((c) => supabase.from('crm_passes').select('member_id,product_name,category,ends_on,registered_on').in('member_id', c).in('status', ['사용 중', '예정', '홀딩']))),
+    Promise.all(chunks.map((c) => selectAll(() => supabase.from('crm_attendance').select('member_id').in('member_id', c).gte('checked_at', monthStart)))),
   ]);
-  const passName = {}, ptName = {}, visits = {};
+  const passName = {}, ptName = {}, visits = {}, regOn = {};
   ps.forEach(({ data: d, error: e }) => { if (e) throw e; d.forEach((p) => {
+    if (p.registered_on && p.registered_on <= today && (!regOn[p.member_id] || p.registered_on > regOn[p.member_id])) regOn[p.member_id] = p.registered_on;
     const g = salesGroup(p.product_name, p.category);
     if (g === 'PT') { ptName[p.member_id] = p.product_name; return; }
     if (!passName[p.member_id] || String(p.ends_on) > String(passName[p.member_id].ends_on)) passName[p.member_id] = p;
   }); });
-  at.forEach(({ data: d, error: e }) => { if (e) throw e; d.forEach((a) => { visits[a.member_id] = (visits[a.member_id] || 0) + 1; }); });
-  const out = page.map((m) => ({ ...m, pass_name: passName[m.id] ? passName[m.id].product_name : null, pt_name: ptName[m.id] || null, month_visits: visits[m.id] || 0 }));
-  return [200, { members: out, total: big ? rows.length : count, counts }];
+  at.forEach((d) => d.forEach((a) => { visits[a.member_id] = (visits[a.member_id] || 0) + 1; }));
+  let out = rows.map((m) => ({ ...m, pass_name: passName[m.id] ? passName[m.id].product_name : null, pt_name: ptName[m.id] || null, month_visits: visits[m.id] || 0, registered_on: regOn[m.id] || m.first_started_on || null }));
+  const STAGE_ORDER = ['체험·신규', '정착', '미출석', '만료 예정', '만료·이탈'];
+  const val = (m) => key === 'reg' ? m.registered_on : key === 'name' ? m.name : key === 'status' ? (m.holding ? 9 : STAGE_ORDER.indexOf(m.stage)) : key === 'pass' ? (m.pass_name || m.usage_tag || '') : key === 'left' ? (m.sub === '구독 중' || m.sub === '쉬어가기' ? 9999 : m.days_left) : key === 'visits' ? m.month_visits : m.days_absent;
+  out.sort((a, b) => {
+    const x = val(a), y = val(b);
+    if (x == null || x === '') return y == null || y === '' ? 0 : 1;
+    if (y == null || y === '') return -1;
+    const c = typeof x === 'number' && typeof y === 'number' ? x - y : String(x).localeCompare(String(y), 'ko');
+    return asc ? c : -c;
+  });
+  if (big) out = out.slice(offset, offset + Math.min(limit, 100));
+  return [200, { members: out, total: big ? rows.length : count, counts, sort: key, dir: asc ? 'asc' : 'desc' }];
 }
 
 // ---------- 회원 상세 ----------
@@ -1046,7 +1182,7 @@ async function member({ id }) {
   const [m, passes, payments, lockers, inquiries] = await Promise.all([
     supabase.from('crm_members').select('*').eq('id', id).maybeSingle(),
     supabase.from('crm_passes').select('id,product_name,category,status,starts_on,ends_on,total_count,remaining_count,trainer,price_paid,registered_on').eq('member_id', id).order('starts_on', { ascending: true }),
-    supabase.from('crm_payments').select('amount,kind,method,staff_name,paid_at,pass_id').eq('member_id', id).order('paid_at', { ascending: true }),
+    supabase.from('crm_payments').select('id,amount,kind,method,staff_name,paid_at,pass_id').eq('member_id', id).order('paid_at', { ascending: true }),
     supabase.from('crm_locker_assignments').select('locker_no,status,starts_on,ends_on,price_paid,billing').eq('member_id', id).order('starts_on', { ascending: true }),
     supabase.from('crm_inquiries').select('inquired_at,raw_note,result').eq('member_id', id).order('inquired_at', { ascending: true }),
   ]);
@@ -1197,9 +1333,9 @@ async function photoUpload({ id, image }) {
 }
 
 const ACTIONS = { dashboard, members, member, lockerBoard, kioskRegister, checkinFind, checkin, photoUpload,
-  taskDone, taskUndo, staffList, staffAdd, staffRemove, financeGet, financeSave, salesYear, subSearch, subLink, staffUpdate, rolesSave, report, memoAdd, inquiryAdd, inquiryList, inquiryUpdate, ptBoard, revenue, msgRules, msgRulesSave, ptSession, ptAssign, ptSetLeft, notionSync };
+  taskDone, taskUndo, staffList, staffAdd, staffRemove, financeGet, financeSave, salesYear, subSearch, subLink, staffUpdate, rolesSave, report, memoAdd, inquiryAdd, inquiryList, inquiryUpdate, ptBoard, revenue, msgRules, msgRulesSave, ptSession, ptAssign, ptSetLeft, notionSync, passUpdate, paymentMethod, staffOrder, roleColor };
 const KIOSK_OK = ['checkinFind', 'checkin', 'photoUpload'];
-const WRITES = ['checkin', 'photoUpload', 'taskDone', 'taskUndo', 'staffAdd', 'staffUpdate', 'staffRemove', 'financeSave', 'subLink', 'rolesSave', 'memoAdd', 'inquiryAdd', 'inquiryUpdate', 'msgRulesSave', 'ptSession', 'ptAssign', 'ptSetLeft', 'notionSync'];
+const WRITES = ['checkin', 'photoUpload', 'taskDone', 'taskUndo', 'staffAdd', 'staffUpdate', 'staffRemove', 'financeSave', 'subLink', 'rolesSave', 'memoAdd', 'inquiryAdd', 'inquiryUpdate', 'msgRulesSave', 'ptSession', 'ptAssign', 'ptSetLeft', 'notionSync', 'passUpdate', 'paymentMethod', 'staffOrder', 'roleColor'];
 
 export default async function handler(req, res) {
   cors(req, res);
