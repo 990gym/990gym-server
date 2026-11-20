@@ -304,7 +304,7 @@ async function dashboard() {
       lockerSoon: assigns.filter((a) => a.ends_on && daysBetween(today, a.ends_on) >= 0 && daysBetween(today, a.ends_on) <= 7).length,
       ptMembers: Object.keys(ptLeft).length, ptSessionsLeft: Object.values(ptLeft).reduce((a, b) => a + b, 0),
       endingToday: active.filter((m) => m.days_left === 0).length,
-      subscribers: comp['월구독'], subCancel: all.filter((m) => m.sub === '해지 신청' && m.stage !== '만료·이탈').length, subFail: all.filter((m) => m.sub === '결제 실패' && m.stage !== '만료·이탈').length,
+      subscribers: comp['월구독'], subCancel: all.filter((m) => m.sub === '해지 신청' && m.stage === '만료 예정').length, subFail: all.filter((m) => m.sub === '결제 실패' && m.stage === '만료 예정').length,
     },
     stages, comp, pt, trend,
     attendance: { now: Object.keys(inGym).length, today: seenToday.size, hours, usual: usual.map((v) => Math.round((v / nUsual) * 10) / 10), hasUsual: usualDays.size > 0 },
