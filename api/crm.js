@@ -1569,11 +1569,17 @@ function uniqDays(rows) {
   rows.forEach((r) => { const k = `${r.member_id}|${kstDate(r.checked_at)}`; const o = m.get(k); if (!o || r.checked_at < o.checked_at) m.set(k, r); });
   return [...m.values()];
 }
+const hhmm = () => new Date(Date.now() + 9 * 3600e3).toISOString().slice(11, 16); // 한국 시각 19:45
 function checkinMessage(name, r) {
-  const left = r.sub === '구독 중' || r.sub === '쉬어가기' ? '월구독' : r.days_left != null ? `${r.days_left}일 남음` : null;
-  const parts = [r.product || null, left, r.pt_left ? `PT ${r.pt_left}회 남음` : null].filter(Boolean);
-  if (r.again) return { title: `[990짐] ${name}님 다시 입실`, body: [`오늘 ${r.today_n}번째`].concat(parts).join(' · '), tag: `att-${Date.now()}` };
-  return { title: `[990짐] ${name}님 출석${r.first_time ? ' · 첫 방문' : ''}`, body: parts.join(' · ') || '정상 출석', tag: `att-${Date.now()}` };
+  // 브로제이 운톡처럼 줄을 나눠서: 이용권 / 종료일(남은 날)
+  const sub = r.sub === '구독 중' || r.sub === '쉬어가기';
+  const lines = [];
+  if (r.again) lines.push(`오늘 ${r.today_n}번째 입실`);
+  if (r.product) lines.push(`이용권: ${r.product}`); // PT 남은 횟수는 아직 정확하지 않아 알림에 안 넣는다
+  if (sub) lines.push(`월구독${r.next_billing ? ` · 다음 결제 ${r.next_billing}` : ''}`);
+  else if (r.ends_on) lines.push(`종료일: ${r.ends_on}${r.days_left != null ? ` (${r.days_left}일 남음)` : ''}`);
+  const head = r.again ? '다시 입실' : `출석${r.first_time ? ' · 첫 방문' : ''}`;
+  return { title: `[990짐] ${name}님 ${head} · ${hhmm()}`, body: lines.join('\n') || '정상 출석', tag: `att-${Date.now()}` };
 }
 
 async function checkin({ id }) {
@@ -1591,7 +1597,7 @@ async function checkin({ id }) {
   const base = { name: m.name, photo_url: await photoUrl(m.photo_path), needs_photo: !m.photo_path };
   if (d.stage === '만료·이탈' || m.holding) {
     const reason = m.holding ? '지금 홀딩 중이에요. 인포에 말씀해 주세요.' : '이용권이 끝났어요. 인포에 말씀해 주세요.';
-    await pushSend({ title: `[990짐] ⚠ ${m.name}님 입실 시도`, body: m.holding ? '홀딩 중인 회원이에요' : '이용권이 끝난 회원이에요', tag: `att-${Date.now()}` });
+    await pushSend({ title: `[990짐] ⚠ ${m.name}님 입실 시도 · ${hhmm()}`, body: m.holding ? '홀딩 중인 회원이에요' : `이용권이 끝난 회원이에요${m.ends_on ? `\n종료일: ${m.ends_on}` : ''}`, tag: `att-${Date.now()}` });
     return [200, { ...base, blocked: true, reason }];
   }
 
