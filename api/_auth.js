@@ -51,13 +51,24 @@ function matchHash(pw, stored) {
   return sameText(crypto.scryptSync(String(pw), salt, 32).toString('base64url'), key);
 }
 
-function signingKey(cred) {
+// 로그인 도장 열쇠: DB(admin_settings 'token_secret')에 있는 하나를 미국·서울 서버가 같이 쓴다.
+// 그래야 어느 서버가 찍은 도장이든 다른 서버가 바로 확인한다. (DB에 없으면 예전 방식)
+let tsCache = { at: 0, v: null };
+async function tokenSecret(supabase) {
+  if (Date.now() - tsCache.at < CACHE_MS) return tsCache.v;
+  const { data, error } = await supabase.from('admin_settings').select('value').eq('key', 'token_secret').maybeSingle();
+  const v = error ? null : (data ? data.value : null);
+  tsCache = { at: Date.now(), v };
+  return v;
+}
+function signingKey(cred, ts) {
+  if (ts) return crypto.createHash('sha256').update(`990gym-admin|${cred && cred.kind === 'db' ? cred.hash : ''}|${ts}`).digest();
   const fp = cred.kind === 'db' ? cred.hash : cred.pw;
   const salt = process.env.ADMIN_TOKEN_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY || '';
   return crypto.createHash('sha256').update(`990gym-admin|${fp}|${salt}`).digest();
 }
 
-const sign = (cred, body) => crypto.createHmac('sha256', signingKey(cred)).update(body).digest('base64url');
+const sign = (cred, ts, body) => crypto.createHmac('sha256', signingKey(cred, ts)).update(body).digest('base64url');
 
 export async function passwordConfigured(supabase) {
   return !!(await credential(supabase));
@@ -70,18 +81,18 @@ export async function checkPassword(supabase, pw) {
 }
 
 export async function issueToken(supabase) {
-  const cred = await credential(supabase);
+  const [cred, ts] = await Promise.all([credential(supabase), tokenSecret(supabase)]);
   const exp = Date.now() + TOKEN_HOURS * 60 * 60 * 1000;
   const body = Buffer.from(JSON.stringify({ exp })).toString('base64url');
-  return { token: `${body}.${sign(cred, body)}`, expiresAt: exp };
+  return { token: `${body}.${sign(cred, ts, body)}`, expiresAt: exp };
 }
 
 export async function verifyToken(supabase, token) {
   if (typeof token !== 'string') return false;
   const [body, sig] = token.split('.');
   if (!body || !sig) return false;
-  const cred = await credential(supabase);
-  if (!cred || !sameText(sig, sign(cred, body))) return false;
+  const [cred, ts] = await Promise.all([credential(supabase), tokenSecret(supabase)]);
+  if ((!cred && !ts) || !sameText(sig, sign(cred, ts, body))) return false;
   try {
     const { exp } = JSON.parse(Buffer.from(body, 'base64url').toString());
     return Number(exp) > Date.now();
