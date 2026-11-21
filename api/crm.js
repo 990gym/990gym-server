@@ -1515,6 +1515,59 @@ async function checkinFind({ digits }) {
   return [200, { matches: list.map((m) => ({ id: m.id, name: list.length > 1 ? maskName(m.name) : m.name, active: m.stage !== '만료·이탈', has_photo: !!m.photo_path })) }];
 }
 
+// ---------- 직원 폰 출석 알림 (웹 푸시) ----------
+// 열쇠(VAPID)는 처음 쓸 때 서버가 만들어 admin_settings 'vapid' 에 둔다 (밖으로 안 나간다)
+async function vapid() {
+  const read = async () => { const { data } = await supabase.from('admin_settings').select('value').eq('key', 'vapid').maybeSingle(); return data ? JSON.parse(data.value) : null; };
+  let v = await read();
+  if (!v) {
+    const { default: webpush } = await import('web-push');
+    const k = webpush.generateVAPIDKeys();
+    await supabase.from('admin_settings').insert({ key: 'vapid', value: JSON.stringify(k), updated_at: new Date().toISOString() });
+    v = await read(); // 동시에 만들었으면 먼저 저장된 걸 쓴다
+  }
+  return v;
+}
+async function pushKey() { return [200, { key: (await vapid()).publicKey }]; }
+async function pushSubscribe({ sub, staff, device, off }) {
+  const ep = sub && String(sub.endpoint || '');
+  if (!/^https:\/\//.test(ep)) return [400, { error: '알림 정보가 맞지 않아요' }];
+  if (off) { await supabase.from('crm_push_subs').delete().eq('endpoint', ep); return [200, { ok: true }]; }
+  const k = sub.keys || {};
+  if (!k.p256dh || !k.auth) return [400, { error: '알림 정보가 맞지 않아요' }];
+  const { error } = await supabase.from('crm_push_subs').upsert({ endpoint: ep, p256dh: k.p256dh, auth: k.auth, staff_name: staff ? String(staff).slice(0, 20) : null, device: device ? String(device).slice(0, 60) : null }, { onConflict: 'endpoint' });
+  if (error) throw error;
+  return [200, { ok: true }];
+}
+// 알림 보내기: 등록된 폰 전부 (한 곳만 고르면 only). 2초 넘게 안 기다린다. 없어진 폰은 지운다.
+async function pushSend(msg, only) {
+  try {
+    const [{ default: webpush }, v, subs] = await Promise.all([
+      import('web-push'), vapid(),
+      only ? Promise.resolve({ data: [only] }) : supabase.from('crm_push_subs').select('endpoint,p256dh,auth'),
+    ]);
+    const list = (subs.data || []).filter((x) => x && x.endpoint);
+    if (!list.length) return 0;
+    const body = JSON.stringify(msg);
+    const opt = { vapidDetails: { subject: 'https://the990.co.kr', publicKey: v.publicKey, privateKey: v.privateKey }, TTL: 3600, timeout: 2000 };
+    const res = await Promise.allSettled(list.map((x) => webpush.sendNotification({ endpoint: x.endpoint, keys: { p256dh: x.p256dh, auth: x.auth } }, body, opt)));
+    const gone = list.filter((x, i) => res[i].status === 'rejected' && [404, 410].includes(res[i].reason && res[i].reason.statusCode)).map((x) => x.endpoint);
+    if (gone.length) await supabase.from('crm_push_subs').delete().in('endpoint', gone);
+    return res.filter((r) => r.status === 'fulfilled').length;
+  } catch (e) { console.error('push', e && e.message); return 0; }
+}
+async function pushTest({ sub }) {
+  const ep = sub && sub.endpoint, k = (sub && sub.keys) || {};
+  if (!ep || !k.p256dh || !k.auth) return [400, { error: '알림 정보가 맞지 않아요' }];
+  const n = await pushSend({ title: '990crm 출석 알림', body: '이 폰으로 출석 알림이 와요 ✓', tag: 'test' }, { endpoint: ep, p256dh: k.p256dh, auth: k.auth });
+  return n ? [200, { ok: true }] : [500, { error: '알림을 보내지 못했어요' }];
+}
+function checkinMessage(name, r) {
+  const left = r.sub === '구독 중' || r.sub === '쉬어가기' ? '월구독' : r.days_left != null ? `${r.days_left}일 남음` : null;
+  const parts = [r.product || null, left, r.pt_left ? `PT ${r.pt_left}회 남음` : null].filter(Boolean);
+  return { title: `[990짐] ${name}님 출석${r.first_time ? ' · 첫 방문' : ''}`, body: parts.join(' · ') || '정상 출석', tag: `att-${Date.now()}` };
+}
+
 async function checkin({ id }) {
   if (!id) return [400, { error: '필수 정보 누락' }];
   const today = todayKST();
@@ -1528,8 +1581,11 @@ async function checkin({ id }) {
   ]);
   if (passes.error || recent.error) throw passes.error || recent.error;
   const base = { name: m.name, photo_url: await photoUrl(m.photo_path), needs_photo: !m.photo_path };
-  if (d.stage === '만료·이탈') return [200, { ...base, blocked: true, reason: '이용권이 끝났어요. 인포에 말씀해 주세요.' }];
-  if (m.holding) return [200, { ...base, blocked: true, reason: '지금 홀딩 중이에요. 인포에 말씀해 주세요.' }];
+  if (d.stage === '만료·이탈' || m.holding) {
+    const reason = m.holding ? '지금 홀딩 중이에요. 인포에 말씀해 주세요.' : '이용권이 끝났어요. 인포에 말씀해 주세요.';
+    await pushSend({ title: `[990짐] ⚠ ${m.name}님 입실 시도`, body: m.holding ? '홀딩 중인 회원이에요' : '이용권이 끝난 회원이에요', tag: `att-${Date.now()}` });
+    return [200, { ...base, blocked: true, reason }];
+  }
 
   // 2시간 안에 이미 찍었으면 한 번으로 친다
   const last = recent.data[0] ? Date.parse(recent.data[0].checked_at) : 0;
@@ -1544,9 +1600,11 @@ async function checkin({ id }) {
   const thisMonth = recent.data.filter((r) => new Date(Date.parse(r.checked_at) + 9 * 3600e3).toISOString().slice(0, 7) === month).length + (again ? 0 : 1);
   const pt = passes.data.filter((p) => /PT/.test(p.product_name) || p.category === 'PT');
   const main = passes.data.filter((p) => !pt.includes(p)).sort((a, b) => String(b.ends_on).localeCompare(String(a.ends_on)))[0];
-  return [200, { ...base, again, days_left: d.days_left, ends_on: d.ends_on, sub: d.sub, next_billing: d.next_billing, product: main ? main.product_name : null,
+  const out = { ...base, again, days_left: d.days_left, ends_on: d.ends_on, sub: d.sub, next_billing: d.next_billing, product: main ? main.product_name : null,
     pt_left: pt.reduce((a, p) => a + (p.remaining_count || 0), 0), pt_total: pt.reduce((a, p) => a + (p.total_count || 0), 0),
-    this_month: thisMonth, first_time: !m.last_attended_on }];
+    this_month: thisMonth, first_time: !m.last_attended_on };
+  if (!again) await pushSend(checkinMessage(m.name, out)); // 직원 폰으로 (2시간 안에 다시 찍은 건 안 보냄)
+  return [200, out];
 }
 
 // 첫 입실 사진 (태블릿 카메라). jpeg base64, 1MB 이하
@@ -1578,9 +1636,9 @@ async function tokenOk(tk) {
 }
 
 const ACTIONS = { dashboard, members, member, lockerBoard, kioskRegister, checkinFind, checkin, photoUpload,
-  taskDone, taskUndo, staffList, staffAdd, staffRemove, financeGet, financeSave, salesYear, subSearch, subLink, staffUpdate, rolesSave, report, memoAdd, inquiryAdd, inquiryList, inquiryUpdate, ptBoard, revenue, msgRules, msgRulesSave, ptSession, ptAssign, ptSetLeft, notionSync, passUpdate, paymentMethod, staffOrder, roleColor, taskSnooze, reportV2, attendanceDay };
+  taskDone, taskUndo, staffList, staffAdd, staffRemove, financeGet, financeSave, salesYear, subSearch, subLink, staffUpdate, rolesSave, report, memoAdd, inquiryAdd, inquiryList, inquiryUpdate, ptBoard, revenue, msgRules, msgRulesSave, ptSession, ptAssign, ptSetLeft, notionSync, passUpdate, paymentMethod, staffOrder, roleColor, taskSnooze, reportV2, attendanceDay, pushKey, pushSubscribe, pushTest };
 const KIOSK_OK = ['checkinFind', 'checkin', 'photoUpload'];
-const WRITES = ['checkin', 'photoUpload', 'taskDone', 'taskUndo', 'staffAdd', 'staffUpdate', 'staffRemove', 'financeSave', 'subLink', 'rolesSave', 'memoAdd', 'inquiryAdd', 'inquiryUpdate', 'msgRulesSave', 'ptSession', 'ptAssign', 'ptSetLeft', 'notionSync', 'passUpdate', 'paymentMethod', 'staffOrder', 'roleColor', 'taskSnooze'];
+const WRITES = ['checkin', 'photoUpload', 'taskDone', 'taskUndo', 'staffAdd', 'staffUpdate', 'staffRemove', 'financeSave', 'subLink', 'rolesSave', 'memoAdd', 'inquiryAdd', 'inquiryUpdate', 'msgRulesSave', 'ptSession', 'ptAssign', 'ptSetLeft', 'notionSync', 'passUpdate', 'paymentMethod', 'staffOrder', 'roleColor', 'taskSnooze', 'pushSubscribe', 'pushTest'];
 
 export default async function handler(req, res) {
   cors(req, res);
