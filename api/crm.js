@@ -770,6 +770,23 @@ async function attendanceImport({ key, rows }) {
   return [200, { saved: out.length, unmatched: Object.values(miss).reduce((a, b) => a + b, 0), unmatchedPhones: Object.keys(miss).length }];
 }
 
+// 브로제이 원본 보관 (매출내역·회원·이용권·락커·메모 등) — 같은 1회용 키 사용
+const BROJ_KINDS = ['sales', 'members', 'passes', 'lockers', 'memos', 'holds'];
+async function brojImport({ key, kind, rows }) {
+  const st = await supabase.from('crm_settings').select('value').eq('key', 'att_import').maybeSingle();
+  if (st.error) throw st.error;
+  const v = st.data && st.data.value;
+  if (!v || !key || v.key !== key || Date.now() > Date.parse(v.expires)) return [401, { error: '가져오기 키가 맞지 않거나 끝났어요' }];
+  if (!BROJ_KINDS.includes(kind)) return [400, { error: '종류가 맞지 않아요' }];
+  if (!Array.isArray(rows) || rows.length > 3000) return [400, { error: '한 번에 3000줄까지예요' }];
+  const out = rows.filter((r) => r && Number(r.k)).map((r) => ({ kind, broj_key: Number(r.k), data: r, fetched_at: new Date().toISOString() }));
+  for (let i = 0; i < out.length; i += 500) {
+    const { error } = await supabase.from('crm_broj_raw').upsert(out.slice(i, i + 500), { onConflict: 'kind,broj_key' });
+    if (error) throw error;
+  }
+  return [200, { saved: out.length }];
+}
+
 // ---------- 자동 문자 규칙 (발송 업체 연결 전: 켜고 끄기와 대상 수만) ----------
 const MSG_RULES = [
   { key: 'inq_price', stage: '유입', type: '자동 발송', title: '문의 즉시 가격 안내', body: '{이름}님, 990짐에 문의 주셔서 감사해요. 가격표와 시설 사진 → {링크}' },
@@ -1542,6 +1559,9 @@ export default async function handler(req, res) {
   let params = req.body || {};
   if (typeof params === 'string') { try { params = JSON.parse(params); } catch (e) { params = {}; } }
   // 브로제이 출석 가져오기: 브로제이 화면에서 바로 보내므로 로그인 대신 한 번 쓰는 가져오기 키로 확인
+  if (params.action === 'brojImport') {
+    try { const [code, body] = await brojImport(params); return res.status(code).json(body); } catch (e) { console.error('brojImport', e); return res.status(500).json({ error: '서버 오류' }); }
+  }
   if (params.action === 'attendanceImport') {
     try { const [code, body] = await attendanceImport(params); return res.status(code).json(body); } catch (e) { console.error('attendanceImport', e); return res.status(500).json({ error: '서버 오류' }); }
   }
