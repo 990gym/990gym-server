@@ -177,7 +177,7 @@ async function passesByIds(ids, known = {}) {
   return out;
 }
 async function paymentsWithGroup(fromISO, known, toISO) {
-  const pays = await selectAll(() => { let q = supabase.from('crm_payments').select('id,amount,paid_at,pass_id,member_id,kind,method').gte('paid_at', fromISO); if (toISO) q = q.lt('paid_at', toISO); return q; });
+  const pays = await selectAll(() => { let q = supabase.from('crm_payments').select('id,amount,paid_at,pass_id,member_id,kind,method,method_split,method_note').gte('paid_at', fromISO); if (toISO) q = q.lt('paid_at', toISO); return q; });
   const pm = await passesByIds(pays.map((p) => p.pass_id), known);
   return pays.map((p) => { const ps = pm[p.pass_id] || {}; return { ...p, day: kstDate(p.paid_at), group: salesGroup(ps.product_name, ps.category) }; });
 }
@@ -582,7 +582,7 @@ async function revenue({ period = 'month' }) {
     paymentsWithGroup(kstStart(from), {}, kstEndEx(to)),
     getFinance(),
     supabase.from('subscribers').select('name,plan,status,next_billing_date'),
-    supabase.from('crm_payments').select('id,amount,paid_at,pass_id,member_id,kind,method').order('paid_at', { ascending: false }).limit(8),
+    supabase.from('crm_payments').select('id,amount,paid_at,pass_id,member_id,kind,method,method_split,method_note').order('paid_at', { ascending: false }).limit(8),
   ]);
   if (subs.error || recent.error) throw subs.error || recent.error;
   const total = pays.reduce((a, p) => a + p.amount, 0);
@@ -597,11 +597,15 @@ async function revenue({ period = 'month' }) {
   const mids = [...new Set(pick.map((p) => p.member_id))];
   const nm = {};
   if (mids.length) { const { data, error } = await supabase.from('crm_members').select('id,name').in('id', mids); if (error) throw error; data.forEach((m) => { nm[m.id] = m.name; }); }
-  const list = pick.map((p) => ({ id: p.id, method: p.method || null, name: nm[p.member_id] || '-', member_id: p.member_id, amount: p.amount, kind: p.kind, product: (pm[p.pass_id] || {}).product_name || '-', group: salesGroup((pm[p.pass_id] || {}).product_name, (pm[p.pass_id] || {}).category), at: p.paid_at }));
+  const list = pick.map((p) => ({ id: p.id, method: p.method || null, split: p.method_split || null, note: p.method_note || null, name: nm[p.member_id] || '-', member_id: p.member_id, amount: p.amount, kind: p.kind, product: (pm[p.pass_id] || {}).product_name || '-', group: salesGroup((pm[p.pass_id] || {}).product_name, (pm[p.pass_id] || {}).category), at: p.paid_at }));
   const days = Math.round((Date.parse(to) - Date.parse(from)) / DAY) + 1;
   // 결제 방법 (월구독은 토스 자동결제라 뺀다)
   const methods = {}; PAY_METHODS.concat(['미입력']).forEach((k) => { methods[k] = { amount: 0, count: 0 }; });
-  pays.filter((p) => p.group !== '월구독').forEach((p) => { const k = PAY_METHODS.includes(p.method) ? p.method : '미입력'; methods[k].amount += p.amount; methods[k].count++; });
+  pays.filter((p) => p.group !== '월구독').forEach((p) => {
+    const sp = p.method_split && typeof p.method_split === 'object' ? Object.entries(p.method_split).filter(([k]) => PAY_METHODS.includes(k)) : [];
+    if (sp.length > 1) { sp.forEach(([k, v]) => { methods[k].amount += Number(v) || 0; methods[k].count++; }); return; }
+    const k = PAY_METHODS.includes(p.method) ? p.method : '미입력'; methods[k].amount += p.amount; methods[k].count++;
+  });
   return [200, { period, label, from, to, today, days, total, count: pays.length, groups, daily, methods, goal: period === 'today' ? Math.round(finance.target / 30) : finance.target,
     dailyGoal: Math.round(finance.target / 30), lastPayDay: pays.reduce((a, p) => (p.day > a ? p.day : a), '') || null,
     unpaid: { count: fails.length, amount: fails.reduce((a, x) => a + (PLAN_PRICE[x.plan] || 39000), 0) },
@@ -998,7 +1002,7 @@ async function passUpdate({ id, product_name, status, starts_on, ends_on, total_
   let methodNote = '';
   if (method !== undefined && method !== null) {
     if (method && !PAY_METHODS.includes(method)) return [400, { error: '결제 방법을 다시 골라주세요' }];
-    const { error } = await supabase.from('crm_payments').update({ method: method || null }).eq('pass_id', id);
+    const { error } = await supabase.from('crm_payments').update({ method: method || null, method_split: null, method_note: null }).eq('pass_id', id);
     if (error) throw error;
     methodNote = method ? `결제 방법 ${method}` : '';
   }
@@ -1024,7 +1028,7 @@ async function passUpdate({ id, product_name, status, starts_on, ends_on, total_
 async function paymentMethod({ id, method }) {
   if (!id) return [400, { error: '필수 정보 누락' }];
   if (method && !PAY_METHODS.includes(method)) return [400, { error: '결제 방법을 다시 골라주세요' }];
-  const { error } = await supabase.from('crm_payments').update({ method: method || null }).eq('id', id);
+  const { error } = await supabase.from('crm_payments').update({ method: method || null, method_split: null, method_note: null }).eq('id', id);
   if (error) throw error;
   return [200, { ok: true }];
 }
@@ -1393,7 +1397,7 @@ async function member({ id }) {
   const [m, passes, payments, lockers, inquiries] = await Promise.all([
     supabase.from('crm_members').select('*').eq('id', id).maybeSingle(),
     supabase.from('crm_passes').select('id,product_name,category,status,starts_on,ends_on,total_count,remaining_count,trainer,price_paid,registered_on').eq('member_id', id).order('starts_on', { ascending: true }),
-    supabase.from('crm_payments').select('id,amount,kind,method,staff_name,paid_at,pass_id').eq('member_id', id).order('paid_at', { ascending: true }),
+    supabase.from('crm_payments').select('id,amount,kind,method,method_split,method_note,staff_name,paid_at,pass_id').eq('member_id', id).order('paid_at', { ascending: true }),
     supabase.from('crm_locker_assignments').select('locker_no,status,starts_on,ends_on,price_paid,billing').eq('member_id', id).order('starts_on', { ascending: true }),
     supabase.from('crm_inquiries').select('inquired_at,raw_note,result').eq('member_id', id).order('inquired_at', { ascending: true }),
   ]);
