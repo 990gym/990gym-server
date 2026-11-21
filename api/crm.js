@@ -93,15 +93,15 @@ async function selectAll(build) {
     }
   }
 }
-// 같은 서버가 연달아 받으면 잠깐 기억해 둔 결과를 쓴다 (바꾸는 요청이 오면 지운다)
+// 결과를 기억해 두지 않는다 (항상 DB 최신 그대로 → 입실 체크도 바로 보인다).
+// 한 요청 안에서 같은 걸 동시에 여러 군데서 찾을 때만 한 번으로 합친다.
 const CACHE = new Map();
 async function memo(key, ms, fn) {
   const hit = CACHE.get(key);
-  if (hit && Date.now() - hit.at < ms) return hit.p;
-  // 같은 걸 동시에 여러 군데서 찾으면 한 번만 DB에 묻는다
+  if (hit) return hit;
   const p = Promise.resolve().then(fn);
-  CACHE.set(key, { at: Date.now(), p });
-  p.catch(() => { if (CACHE.get(key) && CACHE.get(key).p === p) CACHE.delete(key); });
+  CACHE.set(key, p);
+  p.finally(() => { if (CACHE.get(key) === p) CACHE.delete(key); }).catch(() => {});
   return p;
 }
 const clearCache = () => CACHE.clear();
@@ -1605,9 +1605,7 @@ export default async function handler(req, res) {
   const kiosk = KIOSK_OK.includes(params.action) && isKiosk(tk);
   if (!kiosk && !(await tokenOk(tk))) return res.status(401).json({ error: '로그인이 필요해요' });
   try {
-    if (WRITES.includes(params.action)) clearCache();
     const [code, body] = await fn(params);
-    if (WRITES.includes(params.action)) clearCache();
     return res.status(code).json(body);
   } catch (e) {
     console.error('crm', params.action, e);
