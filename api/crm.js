@@ -255,7 +255,7 @@ async function dashboardRaw() {
     supabase.from('crm_members').select('id', { count: 'exact', head: true }),
     supabase.from('crm_members').select('created_at').order('created_at', { ascending: false }).limit(1),
     selectAll(() => supabase.from('crm_attendance').select('member_id,checked_at').gte('checked_at', todayStartISO)),
-    selectAll(() => supabase.from('crm_attendance').select('checked_at').gte('checked_at', new Date(Date.parse(todayStartISO) - 28 * DAY).toISOString()).lt('checked_at', todayStartISO)),
+    selectAll(() => supabase.from('crm_attendance').select('member_id,checked_at').gte('checked_at', new Date(Date.parse(todayStartISO) - 28 * DAY).toISOString()).lt('checked_at', todayStartISO)),
     getFinance(),
     supabase.from('crm_staff').select('id,name,role').eq('active', true).order('created_at'),
     subsMap(),
@@ -311,7 +311,7 @@ async function dashboardRaw() {
   });
   const dow = new Date(`${today}T00:00:00Z`).getUTCDay();
   const usual = Array(24).fill(0); const usualDays = new Set();
-  attPast.forEach((a) => { const d = kstDate(a.checked_at); if (new Date(`${d}T00:00:00Z`).getUTCDay() === dow) { usual[kstHour(a.checked_at)]++; usualDays.add(d); } });
+  uniqDays(attPast).forEach((a) => { const d = kstDate(a.checked_at); if (new Date(`${d}T00:00:00Z`).getUTCDay() === dow) { usual[kstHour(a.checked_at)]++; usualDays.add(d); } });
   const nUsual = usualDays.size || 1;
 
   // 이번 달 매출
@@ -700,7 +700,8 @@ async function reportV2({ ym, week }) {
   const months = []; for (let i = 11; i >= 0; i--) months.push(iso(Date.UTC(y, m - 1 - i, 1)).slice(0, 7));
   const trend = months.map((mo) => ({ ym: mo, revenue: pays.filter((p) => p.day.slice(0, 7) === mo).reduce((a, p) => a + p.amount, 0), newPeople: Object.values(firstReg).filter((d) => d.slice(0, 7) === mo).length, hasPays: mo >= '2025-12' }));
   // ⑤ 출석
-  const aIn = att.filter((x) => inR(kstDate(x.checked_at), from, end)), aPrev = att.filter((x) => inR(kstDate(x.checked_at), prevFrom, prevEnd));
+  const attU = uniqDays(att);
+  const aIn = attU.filter((x) => inR(kstDate(x.checked_at), from, end)), aPrev = attU.filter((x) => inR(kstDate(x.checked_at), prevFrom, prevEnd));
   const hours = Array(24).fill(0); aIn.forEach((x) => hours[kstHour(x.checked_at)]++);
   const dayCnt = new Set(aIn.map((x) => kstDate(x.checked_at))).size;
   // ⑥ 왜 그런가 (경로·미등록 사유·해지 사유)
@@ -736,7 +737,7 @@ async function attendanceDay({ date }) {
   const mem = {}, pass = {}, pt = {}, monthN = {};
   mres.forEach(({ data, error }) => { if (error) throw error; markTrial(data.map((m) => decorate(m, today, subs)), trial).forEach((m) => { mem[m.id] = m; }); });
   pres.forEach(({ data, error }) => { if (error) throw error; data.forEach((p) => { if (salesGroup(p.product_name, p.category) === 'PT') { pt[p.member_id] = p.product_name; return; } if (!pass[p.member_id] || String(p.ends_on) > String(pass[p.member_id].ends_on)) pass[p.member_id] = p; }); });
-  ares.forEach((l) => l.forEach((a) => { monthN[a.member_id] = (monthN[a.member_id] || 0) + 1; }));
+  ares.forEach((l) => uniqDays(l).forEach((a) => { monthN[a.member_id] = (monthN[a.member_id] || 0) + 1; }));
   // 한 사람이 여러 번 찍으면 처음 입장 기준 한 줄 + 횟수
   const seen = {}, list = [];
   rows.forEach((r) => {
@@ -1205,7 +1206,7 @@ async function report({ period = 'month' }) {
     nonPT.forEach((x) => { (later[x.member_id] = later[x.member_id] || []).push(x); });
     const endedMembers = [...new Set(ended.map((x) => x.member_id))];
     const renewed = endedMembers.filter((mid) => { const mine = later[mid]; const lastEnd = ended.filter((x) => x.member_id === mid).map((x) => x.ends_on).sort().pop(); return mine.some((x) => x.ends_on > lastEnd && x.starts_on && x.starts_on <= new Date(Date.parse(lastEnd) + 45 * DAY).toISOString().slice(0, 10)); }).length;
-    const at = att.filter((x) => inR(kstDate(x.checked_at), a, b));
+    const at = uniqDays(att).filter((x) => inR(kstDate(x.checked_at), a, b));
     const days = Math.round((Date.parse(b) - Date.parse(a)) / DAY) + 1;
     const hours = Array(24).fill(0); at.forEach((x) => hours[kstHour(x.checked_at)]++);
     const tk = tasks.filter((x) => inR(kstDate(x.done_at), a, b));
@@ -1284,7 +1285,7 @@ async function report({ period = 'month' }) {
   const rev6 = m6.map((ym) => ({ ym, total: pays6.filter((p) => p.day.slice(0, 7) === ym).reduce((a, p) => a + p.amount, 0), pnl: (pnl.data.find((r) => r.ym === ym) || {}).revenue || null }));
   // 요일·시간대 평균 출석
   const heat = Array.from({ length: 7 }, () => Array(6).fill(0)); const dayCount = Array(7).fill(0); const seenDays = new Set();
-  att.filter((x) => inP(kstDate(x.checked_at))).forEach((x) => { const d = kstDate(x.checked_at); const w = (new Date(`${d}T00:00:00Z`).getUTCDay() + 6) % 7; const h = kstHour(x.checked_at); const slot = h < 6 ? -1 : Math.min(5, Math.floor((h - 6) / 3)); if (slot >= 0) heat[w][slot]++; if (!seenDays.has(d)) { seenDays.add(d); dayCount[w]++; } });
+  uniqDays(att).filter((x) => inP(kstDate(x.checked_at))).forEach((x) => { const d = kstDate(x.checked_at); const w = (new Date(`${d}T00:00:00Z`).getUTCDay() + 6) % 7; const h = kstHour(x.checked_at); const slot = h < 6 ? -1 : Math.min(5, Math.floor((h - 6) / 3)); if (slot >= 0) heat[w][slot]++; if (!seenDays.has(d)) { seenDays.add(d); dayCount[w]++; } });
   const heatAvg = heat.map((row, w) => row.map((v) => (dayCount[w] ? Math.round(v / dayCount[w]) : null)));
   const extra = { funnel, sources: Object.values(src).sort((a, b) => b.count - a.count), noReg: Object.entries(noReg).sort((a, b) => b[1] - a[1]), churn: Object.entries(churn).sort((a, b) => b[1] - a[1]), rev6, heat: heatAvg, heatDays: seenDays.size };
   return [200, { ...extra, period: { ...P, compareTo: partial ? dataEnd : P.to, prevCompareTo: partial ? prevEnd : P.prevTo, partial }, today, elapsed, goal, breakeven: isMonth ? finance.breakeven : Math.round(finance.breakeven * 7 / 30), cur, prev, lastPayDay: pays.reduce((a, p) => (p.day > a ? p.day : a), '') || null }];
@@ -1332,7 +1333,7 @@ async function withListExtras(rows, today) {
   const chunks = []; for (let i = 0; i < ids.length; i += 150) chunks.push(ids.slice(i, i + 150));
   const [ps, at, firsts] = await Promise.all([
     Promise.all(chunks.map((c) => supabase.from('crm_passes').select('member_id,product_name,category,ends_on,registered_on').in('member_id', c).in('status', ['사용 중', '예정', '홀딩']))),
-    Promise.all(chunks.map((c) => selectAll(() => supabase.from('crm_attendance').select('member_id').in('member_id', c).gte('checked_at', monthStart)))),
+    Promise.all(chunks.map((c) => selectAll(() => supabase.from('crm_attendance').select('member_id,checked_at').in('member_id', c).gte('checked_at', monthStart)))),
     // 처음 등록한 날 = 문의에서 회원으로 전환된 날 (나중에 PT를 사도 안 바뀜)
     Promise.all(chunks.map((c) => selectAll(() => supabase.from('crm_passes').select('member_id,registered_on').in('member_id', c).neq('status', '무효')))),
   ]);
@@ -1343,7 +1344,7 @@ async function withListExtras(rows, today) {
     if (g === 'PT') { ptName[p.member_id] = p.product_name; return; }
     if (!passName[p.member_id] || String(p.ends_on) > String(passName[p.member_id].ends_on)) passName[p.member_id] = p;
   }); });
-  at.forEach((d) => d.forEach((a) => { visits[a.member_id] = (visits[a.member_id] || 0) + 1; }));
+  at.forEach((d) => uniqDays(d).forEach((a) => { visits[a.member_id] = (visits[a.member_id] || 0) + 1; }));
   return rows.map((m) => ({ ...m, pass_name: passName[m.id] ? passName[m.id].product_name : null, pt_name: ptName[m.id] || null, month_visits: visits[m.id] || 0, registered_on: [regOn[m.id], m.first_started_on].filter(Boolean).sort()[0] || null }));
 }
 async function members({ q = '', stage = '', limit = 60, offset = 0, sort = '', dir = '' }) {
@@ -1424,7 +1425,7 @@ async function member({ id }) {
   ]);
   if (events.error || att.error) throw events.error || att.error;
   const weeks = Array(8).fill(0);
-  att.data.forEach((a) => { const w = Math.floor((Date.now() - Date.parse(a.checked_at)) / (7 * DAY)); if (w >= 0 && w < 8) weeks[7 - w]++; });
+  uniqDays(att.data.map((a) => ({ ...a, member_id: id }))).forEach((a) => { const w = Math.floor((Date.now() - Date.parse(a.checked_at)) / (7 * DAY)); if (w >= 0 && w < 8) weeks[7 - w]++; });
   const err = m.error || passes.error || payments.error || lockers.error || inquiries.error;
   if (err) throw err;
   if (!m.data) return [404, { error: '회원을 찾을 수 없어요' }];
@@ -1562,9 +1563,16 @@ async function pushTest({ sub }) {
   const n = await pushSend({ title: '990crm 출석 알림', body: '이 폰으로 출석 알림이 와요 ✓', tag: 'test' }, { endpoint: ep, p256dh: k.p256dh, auth: k.auth });
   return n ? [200, { ok: true }] : [500, { error: '알림을 보내지 못했어요' }];
 }
+// 출석 횟수는 하루에 한 번으로 센다 (같은 날 여러 번 들어와도 기록은 다 남고, 세는 건 그날 첫 입장 하나)
+function uniqDays(rows) {
+  const m = new Map();
+  rows.forEach((r) => { const k = `${r.member_id}|${kstDate(r.checked_at)}`; const o = m.get(k); if (!o || r.checked_at < o.checked_at) m.set(k, r); });
+  return [...m.values()];
+}
 function checkinMessage(name, r) {
   const left = r.sub === '구독 중' || r.sub === '쉬어가기' ? '월구독' : r.days_left != null ? `${r.days_left}일 남음` : null;
   const parts = [r.product || null, left, r.pt_left ? `PT ${r.pt_left}회 남음` : null].filter(Boolean);
+  if (r.again) return { title: `[990짐] ${name}님 다시 입실`, body: [`오늘 ${r.today_n}번째`].concat(parts).join(' · '), tag: `att-${Date.now()}` };
   return { title: `[990짐] ${name}님 출석${r.first_time ? ' · 첫 방문' : ''}`, body: parts.join(' · ') || '정상 출석', tag: `att-${Date.now()}` };
 }
 
@@ -1587,23 +1595,27 @@ async function checkin({ id }) {
     return [200, { ...base, blocked: true, reason }];
   }
 
-  // 2시간 안에 이미 찍었으면 한 번으로 친다
+  // 10분 안에 또 찍은 건 실수로 보고 무시. 같은 날 다시 들어오면 '다시 입실'로 기록은 남기되 출석 횟수는 하루 한 번.
   const last = recent.data[0] ? Date.parse(recent.data[0].checked_at) : 0;
-  const again = Date.now() - last < 2 * 60 * 60 * 1000;
-  if (!again) {
+  const dup = Date.now() - last < 10 * 60 * 1000;
+  const todayN = recent.data.filter((r) => kstDate(r.checked_at) === today).length;
+  const again = todayN > 0;
+  if (!dup) {
     const ins = await supabase.from('crm_attendance').insert({ member_id: id, via: '태블릿' });
     if (ins.error) throw ins.error;
-    const up = await supabase.from('crm_members').update({ last_attended_on: today, total_visits: (m.total_visits || 0) + 1, updated_at: new Date().toISOString() }).eq('id', id);
-    if (up.error) throw up.error;
+    if (!again) {
+      const up = await supabase.from('crm_members').update({ last_attended_on: today, total_visits: (m.total_visits || 0) + 1, updated_at: new Date().toISOString() }).eq('id', id);
+      if (up.error) throw up.error;
+    }
   }
   const month = today.slice(0, 7);
-  const thisMonth = recent.data.filter((r) => new Date(Date.parse(r.checked_at) + 9 * 3600e3).toISOString().slice(0, 7) === month).length + (again ? 0 : 1);
+  const thisMonth = new Set(recent.data.map((r) => kstDate(r.checked_at)).filter((d) => d.slice(0, 7) === month).concat([today])).size;
   const pt = passes.data.filter((p) => /PT/.test(p.product_name) || p.category === 'PT');
   const main = passes.data.filter((p) => !pt.includes(p)).sort((a, b) => String(b.ends_on).localeCompare(String(a.ends_on)))[0];
   const out = { ...base, again, days_left: d.days_left, ends_on: d.ends_on, sub: d.sub, next_billing: d.next_billing, product: main ? main.product_name : null,
     pt_left: pt.reduce((a, p) => a + (p.remaining_count || 0), 0), pt_total: pt.reduce((a, p) => a + (p.total_count || 0), 0),
-    this_month: thisMonth, first_time: !m.last_attended_on };
-  if (!again) await pushSend(checkinMessage(m.name, out)); // 직원 폰으로 (2시간 안에 다시 찍은 건 안 보냄)
+    this_month: thisMonth, first_time: !m.last_attended_on, dup, today_n: todayN + (dup ? 0 : 1) };
+  if (!dup) await pushSend(checkinMessage(m.name, out)); // 직원 폰으로 (10분 안에 또 찍은 건 안 보냄)
   return [200, out];
 }
 
