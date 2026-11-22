@@ -1,6 +1,7 @@
 import { createClient } from '@supabase/supabase-js';
 import crypto from 'crypto';
 import { cors, bearer, verifyToken } from './_auth.js';
+import { monthlyAmount, getPromo } from './_pricing.js';
 
 // 990 CRM (보기 전용) — the990.co.kr/crm.html 이 부른다.
 // 로그인은 관리자 페이지와 같다 (/api/admin 의 login 토큰을 그대로 쓴다).
@@ -20,7 +21,7 @@ const digitsOf = (p) => String(p || '').replace(/\D/g, '');
 async function subsMap() { return memo('subs', 180000, subsMapRaw); }
 async function subsMapRaw() {
   const [subs, bj] = await Promise.all([
-    supabase.from('subscribers').select('id,name,phone,plan,status,next_billing_date,cancelled_at,paused_at,created_at').order('created_at', { ascending: true }),
+    supabase.from('subscribers').select('id,name,phone,plan,addons,status,next_billing_date,cancelled_at,paused_at,created_at').order('created_at', { ascending: true }),
     selectAll(() => supabase.from('crm_passes').select('member_id').in('status', ['사용 중', '예정', '홀딩']).ilike('product_name', '%구독%')),
   ]);
   if (subs.error) throw subs.error;
@@ -233,6 +234,7 @@ function buildTasks(all, today, inGym, passByMember) {
 // ---------- 대시보드 ----------
 async function dashboard() { return memo('dashboard', 20000, dashboardRaw); }
 async function dashboardRaw() {
+  try { await subSync(); } catch (e) { console.error('subSync', e.message); } // 월구독 자동결제 기록 (10분에 한 번)
   const today = todayKST();
   const month = today.slice(0, 7);
   const recentCut = new Date(Date.parse(today) - 400 * DAY).toISOString().slice(0, 10);
@@ -250,7 +252,7 @@ async function dashboardRaw() {
     ]).then(([a, b]) => a.concat(b)),
     paymentsRaw(monthStartISO),
     supabase.from('crm_lockers').select('number'),
-    selectAll(() => supabase.from('crm_locker_assignments').select('locker_no,member_id,status,ends_on').in('status', ['사용 중', '예정', '홀딩'])),
+    selectAll(() => supabase.from('crm_locker_assignments').select('locker_no,member_id,status,ends_on,billing').in('status', ['사용 중', '예정', '홀딩'])),
     supabase.from('crm_inquiries').select('id,name,phone,source,summary,staff_name,return_on,result,inquired_at,member_id').or(INQ_OK).gte('inquired_at', new Date(Date.parse(today) - 30 * DAY).toISOString()),
     supabase.from('crm_members').select('id', { count: 'exact', head: true }),
     supabase.from('crm_members').select('created_at').order('created_at', { ascending: false }).limit(1),
@@ -325,6 +327,14 @@ async function dashboardRaw() {
   // 할 일
   const passName = Object.fromEntries(Object.entries(mainPass).map(([id, p]) => [id, p.product_name]));
   const tasks = buildTasks(all, today, inGym, passName);
+  // 구독에 락커 애드온을 넣었는데 아직 락커 번호가 없는 분
+  const subLock = new Set(assigns.filter((a) => a.billing === '구독 애드온').map((a) => a.member_id));
+  all.forEach((m) => {
+    const sb = subOf(m, subs);
+    if (!sb || !['active', 'paused'].includes(sb.status) || !(sb.addons || []).includes('locker') || subLock.has(m.id)) return;
+    tasks.push({ key: `lock:${m.id}:`, member_id: m.id, name: m.name, phone: m.phone, in_gym: inGym[m.id] || null, kind: '락커', stage: m.stage, tag: '구독 락커',
+      title: '월구독에 락커를 추가했어요 · 락커 번호를 정해주세요', sub: ['월구독 · 락커 애드온', m.last_attended_on ? `마지막 출석 ${+m.last_attended_on.slice(5, 7)}.${+m.last_attended_on.slice(8)}` : '방문 기록 없음'], action: '락커 번호 배정', group: '오늘 안에' });
+  });
   // 문의 리턴 연락: 결과가 아직 없고 리턴 날짜가 오늘이거나 지난 문의 (7일 안)
   inq.data.filter((q) => !q.result && !q.member_id && q.return_on && q.return_on <= today && daysBetween(q.return_on, today) <= 7).forEach((q) => {
     const sm = parseInqSummary(q.summary);
@@ -1043,6 +1053,126 @@ async function syncMemberEnd(memberId, { allowEarlier = false, removedStart = nu
   if (Object.keys(mp).length) { const { error } = await supabase.from('crm_members').update(mp).eq('id', memberId); if (error) throw error; }
 }
 
+// ---------- 월구독 자동결제 → CRM 기록 ----------
+// 토스 결제 코드는 건드리지 않는다. 구독 DB(subscribers)의 다음 결제일이 넘어가면 그 달 결제가 된 것으로 보고
+// CRM 매출·이용권에 기록한다. 금액은 결제 서버와 같은 가격표(_pricing.js)로 계산한다.
+// enabled 가 꺼져 있으면(브로제이 전환 전) 기록은 안 하고 '어디까지 봤는지'만 따라간다 → 두 번 잡히지 않는다.
+const SUB_SYNC_EVERY = 10 * 60 * 1000;
+const addOneMonth = (d) => addDaysYMD(ymdAddMonths(d, 1), 1);
+const addDaysYMD = (d, n) => { const x = new Date(Date.parse(d)); x.setUTCDate(x.getUTCDate() + n); return x.toISOString().slice(0, 10); };
+function memberForSub(s, members) {
+  const p = digitsOf(s.phone), n = String(s.name || '').trim();
+  return members.find((m) => m.subscriber_id === s.id)
+    || members.find((m) => p && digitsOf(m.phone) === p && String(m.name || '').trim() === n)
+    || (() => { const c = members.filter((m) => p && digitsOf(m.phone) === p); return c.length === 1 ? c[0] : null; })();
+}
+async function subSync({ force = false } = {}) {
+  const st = await supabase.from('crm_settings').select('value').eq('key', 'sub_sync').maybeSingle();
+  if (st.error) throw st.error;
+  const cfg = (st.data && st.data.value) || {};
+  if (!force && cfg.at && Date.now() - Date.parse(cfg.at) < SUB_SYNC_EVERY) return { skipped: true };
+  const { data: subs, error } = await supabase.from('subscribers').select('id,name,phone,plan,addons,status,promo,next_billing_date,created_at');
+  if (error) throw error;
+  const seen = { ...(cfg.seen || {}) }, todo = [], today = todayKST();
+  for (const s of subs) {
+    const prev = seen[s.id], nb = s.next_billing_date;
+    if (cfg.enabled) {
+      if (prev === undefined) {
+        if (cfg.from && kstDate(s.created_at) >= cfg.from) { const pr = getPromo(s.plan, s.promo); todo.push({ s, first: true, day: kstDate(s.created_at), at: s.created_at, amount: pr ? pr.firstAmount : monthlyAmount(s.plan, s.addons) }); }
+      } else if (prev && nb && nb > prev) {
+        for (let d = prev, i = 0; d < nb && i < 12; d = addOneMonth(d), i++) todo.push({ s, first: false, day: d, at: new Date(Date.parse(`${d}T09:00:00+09:00`)).toISOString(), amount: monthlyAmount(s.plan, s.addons) });
+      }
+    }
+    if (nb) seen[s.id] = nb;
+  }
+  let recorded = 0;
+  const logs = [];
+  if (todo.length) {
+    const members = await selectAll(() => supabase.from('crm_members').select('id,name,phone,subscriber_id,lifetime_paid,legacy_id'));
+    for (const t of todo) {
+      if (!t.amount) continue;
+      try { if (await recordSubPayment(t, members)) recorded++; } catch (e) { logs.push(`${t.s.id.slice(0, 8)} ${t.day}: ${e.message}`); }
+    }
+  }
+  await subLockerSync(subs, today);
+  const { error: e2 } = await supabase.from('crm_settings').upsert({ key: 'sub_sync', value: { ...cfg, at: new Date().toISOString(), seen, last: { recorded, errors: logs.slice(0, 5) } }, updated_at: new Date().toISOString() }, { onConflict: 'key' });
+  if (e2) throw e2;
+  if (recorded) clearCache();
+  return { recorded, errors: logs };
+}
+async function recordSubPayment(t, members) {
+  const s = t.s, note = `토스 자동결제 · ${s.id.slice(0, 8)} · ${t.day}`;
+  const ex = await supabase.from('crm_payments').select('id').eq('method_note', note).limit(1);
+  if (ex.error) throw ex.error;
+  if (ex.data.length) return false; // 이미 기록함
+  let m = memberForSub(s, members);
+  if (!m) { // 홈페이지에서 처음 가입한 분 → CRM 회원으로 만든다
+    const phone = normPhone(s.phone);
+    const ins = await supabase.from('crm_members').insert({ name: String(s.name || '이름 없음').slice(0, 30), phone, stage: '체험·신규', checkin_code: digitsOf(phone).slice(-4), source: '990홈페이지', subscriber_id: s.id }).select('id,name,phone,subscriber_id,lifetime_paid,legacy_id').single();
+    if (ins.error) throw ins.error;
+    m = ins.data; members.push(m);
+  }
+  const prevSub = await supabase.from('crm_passes').select('product_name,category').eq('member_id', m.id).not('status', 'in', '("무효","환불")');
+  if (prevSub.error) throw prevSub.error;
+  const kind = prevSub.data.some((x) => salesGroup(x.product_name, x.category) === '월구독') ? '재등록' : '신규';
+  const end = addDaysYMD(addOneMonth(t.day), -1), today = todayKST();
+  const pass = await supabase.from('crm_passes').insert({ member_id: m.id, product_name: `${s.plan} 구독권`, category: '월구독', status: end < today ? '만료' : t.day > today ? '예정' : '사용 중', starts_on: t.day, ends_on: end, price_paid: t.amount, registered_on: t.day }).select('id').single();
+  if (pass.error) throw pass.error;
+  const pay = await supabase.from('crm_payments').insert({ member_id: m.id, pass_id: pass.data.id, list_price: t.amount, amount: t.amount, method: '카드', method_note: note, kind, paid_at: t.at });
+  if (pay.error) { await supabase.from('crm_passes').delete().eq('id', pass.data.id); throw pay.error; }
+  const life = (Number(m.lifetime_paid) || 0) + t.amount;
+  await supabase.from('crm_members').update({ lifetime_paid: life, updated_at: new Date().toISOString() }).eq('id', m.id);
+  m.lifetime_paid = life;
+  await syncMemberEnd(m.id);
+  await supabase.from('crm_events').insert({ member_id: m.id, kind: '월구독 결제', body: `${t.first ? '첫 결제' : '자동결제'} · ${s.plan}${(s.addons || []).length ? ` + ${(s.addons || []).map((a) => (a === 'locker' ? '락커' : a === 'wear' ? '운동복' : a)).join('·')}` : ''} · ${t.amount.toLocaleString()}원 · ${t.day} ~ ${end}` });
+  return true;
+}
+// 구독 락커(애드온): 결제된 날까지 쓰게 끝나는 날을 맞추고, 구독이 끝나면 락커도 끝낸다
+async function subLockerSync(subs, today) {
+  const { data: las, error } = await supabase.from('crm_locker_assignments').select('id,member_id,status,ends_on').eq('billing', '구독 애드온').in('status', ['사용 중', '예정', '홀딩']);
+  if (error) throw error;
+  if (!las.length) return;
+  const { data: ms, error: e2 } = await supabase.from('crm_members').select('id,name,phone,subscriber_id').in('id', [...new Set(las.map((a) => a.member_id))]);
+  if (e2) throw e2;
+  for (const a of las) {
+    const m = ms.find((x) => x.id === a.member_id); if (!m) continue;
+    const s = subs.find((x) => x.id === m.subscriber_id) || subs.find((x) => memberForSub(x, [m]));
+    if (!s || !s.next_billing_date) continue;
+    const paidTo = addDaysYMD(s.next_billing_date, -1);
+    const keep = ['active', 'paused'].includes(s.status) && (s.addons || []).includes('locker');
+    const patch = {};
+    if (keep && a.ends_on !== paidTo) patch.ends_on = paidTo;
+    if (!keep && (!a.ends_on || a.ends_on > paidTo)) patch.ends_on = paidTo;
+    const endNow = patch.ends_on || a.ends_on;
+    if (!keep && endNow && endNow < today) patch.status = '만료';
+    if (Object.keys(patch).length) { const { error: e3 } = await supabase.from('crm_locker_assignments').update(patch).eq('id', a.id); if (e3) throw e3; }
+  }
+}
+// 구독 락커 번호 배정 (할 일 '락커 번호 배정' → 회원 상세에서)
+async function subLocker({ member_id, locker_no, staff }) {
+  const no = Math.round(Number(locker_no));
+  if (!member_id || !no) return [400, { error: '락커 번호를 적어주세요' }];
+  const [lk, busy, m, S] = await Promise.all([
+    supabase.from('crm_lockers').select('number,broken').eq('number', no).maybeSingle(),
+    supabase.from('crm_locker_assignments').select('member_id,ends_on').eq('locker_no', no).in('status', ['사용 중', '예정', '홀딩']),
+    supabase.from('crm_members').select('*').eq('id', member_id).maybeSingle(),
+    subsMap(),
+  ]);
+  if (lk.error || busy.error || m.error) throw lk.error || busy.error || m.error;
+  if (!lk.data) return [400, { error: `${no}번 락커가 없어요` }];
+  if (lk.data.broken) return [400, { error: `${no}번 락커는 고장으로 표시돼 있어요` }];
+  const today = todayKST();
+  const other = busy.data.find((x) => x.member_id !== member_id && (!x.ends_on || x.ends_on >= today));
+  if (other) return [409, { error: `${no}번은 다른 회원이 쓰고 있어요` }];
+  const sb = m.data ? subOf(m.data, S) : null;
+  if (!sb || !(sb.addons || []).includes('locker')) return [400, { error: '이 회원 구독에 락커 애드온이 없어요' }];
+  const { error } = await supabase.from('crm_locker_assignments').insert({ locker_no: no, member_id, status: '사용 중', starts_on: today, ends_on: sb.next_billing_date ? addDaysYMD(sb.next_billing_date, -1) : null, price_paid: 10000, billing: '구독 애드온' });
+  if (error) throw error;
+  await supabase.from('crm_events').insert({ member_id, kind: '락커', body: `구독 락커 ${no}번 배정`, staff_name: staff ? String(staff).slice(0, 20) : null });
+  clearCache();
+  return member({ id: member_id });
+}
+
 // ---------- 등록·결제 입력 ----------
 async function products() {
   const { data, error } = await supabase.from('crm_products').select('id,category,name,list_price,months,sessions,on_sale,sort_order,note').eq('on_sale', true).order('sort_order');
@@ -1051,7 +1181,7 @@ async function products() {
 }
 const ymdAddMonths = (iso, n) => { const d = new Date(Date.parse(iso)); const day = d.getUTCDate(); d.setUTCDate(1); d.setUTCMonth(d.getUTCMonth() + n); const last = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).getUTCDate(); d.setUTCDate(Math.min(day, last)); d.setUTCDate(d.getUTCDate() - 1); return d.toISOString().slice(0, 10); };
 const normPhone = (p) => { const d = digitsOf(p); return d.length === 11 ? `${d.slice(0, 3)}-${d.slice(3, 7)}-${d.slice(7)}` : d.length === 10 ? `${d.slice(0, 3)}-${d.slice(3, 6)}-${d.slice(6)}` : null; };
-async function register({ member_id, new_member, product_id, custom, starts_on, ends_on, sessions, trainer, locker_no, amount, discount_reason, method, split, method_note, kind, staff }) {
+async function register({ inquiry_id, member_id, new_member, product_id, custom, starts_on, ends_on, sessions, trainer, locker_no, amount, discount_reason, method, split, method_note, kind, staff }) {
   const st = staff ? String(staff).slice(0, 20) : null;
   // 1) 상품
   let prod = null;
@@ -1157,6 +1287,7 @@ async function register({ member_id, new_member, product_id, custom, starts_on, 
     const up = await supabase.from('crm_members').update(mp).eq('id', mid);
     if (up.error) throw up.error;
     await syncMemberEnd(mid);
+    try { const ph = await supabase.from('crm_members').select('phone').eq('id', mid).single(); await linkInquiries(mid, ph.data && ph.data.phone, inquiry_id); } catch (e) { console.error('linkInquiries', e.message); }
     const how = sp ? Object.entries(sp).map(([a, b]) => `${a} ${b.toLocaleString()}원`).join(' + ') : m0 || '';
     await supabase.from('crm_events').insert({ member_id: mid, kind: '등록', body: `${k} · ${prod.name} · ${amt.toLocaleString()}원${how ? ` (${how})` : ''}${note ? ` · ${note}` : ''}${lockNo != null && isLocker ? ` · ${lockNo}번 락커` : ''} · ${s}${e ? ` ~ ${e}` : ''}`.slice(0, 500), staff_name: st });
     clearCache();
@@ -1167,6 +1298,23 @@ async function register({ member_id, new_member, product_id, custom, starts_on, 
     if (created) { try { await supabase.from('crm_members').delete().eq('id', mid); } catch (e2) {} }
     throw err;
   }
+}
+// 등록 창 '문의에서 불러오기': 아직 회원과 연결 안 된 문의. 검색어가 없으면 최근 60일, 있으면 기간 상관없이 이름·번호·메모에서 찾는다
+async function regInquiries({ q = '' } = {}) {
+  const key = String(q || '').trim().slice(0, 30), dg = key.replace(/\D/g, '');
+  let query = supabase.from('crm_inquiries').select('id,legacy_id,name,phone,source,summary,raw_note,result,inquired_at').is('member_id', null);
+  if (!key) query = query.gte('inquired_at', new Date(Date.now() - 60 * DAY).toISOString());
+  else if (dg.length >= 3 && dg.length === key.replace(/[\s-]/g, '').length) query = query.ilike('phone', `%${dg.slice(-4)}%`);
+  else query = query.or(`name.ilike.*${key.replace(/[,()*]/g, '')}*,raw_note.ilike.*${key.replace(/[,()*]/g, '')}*`);
+  const { data, error } = await query.order('inquired_at', { ascending: false }).limit(60);
+  if (error) throw error;
+  return [200, { inquiries: data.filter((x) => x.result !== '등록' && (!x.legacy_id || String(x.legacy_id).startsWith('notion:'))).map((x) => ({ id: x.id, name: x.name, phone: x.phone, source: x.source, result: x.result, day: kstDate(x.inquired_at), interest: parseInqSummary(x.summary).interest || null, note: x.raw_note ? x.raw_note.slice(0, 80) : null })) }];
+}
+// 등록하면 그 사람의 문의를 '등록'으로 연결한다 (고른 문의 + 같은 번호의 문의)
+async function linkInquiries(mid, phone, inquiryId) {
+  const patch = { member_id: mid, result: '등록', return_on: null };
+  if (inquiryId) { const { error } = await supabase.from('crm_inquiries').update(patch).eq('id', inquiryId).is('member_id', null); if (error) throw error; }
+  if (phone) { const { error } = await supabase.from('crm_inquiries').update(patch).eq('phone', phone).is('member_id', null); if (error) throw error; }
 }
 // 같은 회원·상품·시작일·금액이 2분 안에 이미 저장됐으면 또 만들지 않는다
 async function recentSame(mid, name, s, amt) {
@@ -1203,6 +1351,7 @@ async function registerUndo({ pass_id, staff }) {
   if (left.error || att.error || m.error) throw left.error || att.error || m.error;
   clearCache();
   if (m.data && !m.data.legacy_id && !left.count && !att.count) {
+    await supabase.from('crm_inquiries').update({ member_id: null, result: null }).eq('member_id', mid); // 등록으로 바꿔 둔 문의를 되돌린다
     const { error } = await supabase.from('crm_members').delete().eq('id', mid);
     if (error) throw error;
     return [200, { deleted_member: true }];
@@ -1618,7 +1767,7 @@ async function member({ id }) {
   const trialSet = new Set(livePs.length && livePs.every((p) => /체험|^PT ?3회$/.test(p.product_name || '')) ? [id] : []);
   return [200, {
     member: { ...markTrial([decorate(safe, today, S)], trialSet)[0], photo_url: await photoUrl(photo_path),
-      subscription: sb ? { id: sb.id, name: sb.name, plan: sb.plan, status: sb.status, next_billing_date: sb.next_billing_date, phone4: digitsOf(sb.phone).slice(-4), linked: safe.subscriber_id === sb.id } : null },
+      subscription: sb ? { id: sb.id, name: sb.name, plan: sb.plan, addons: sb.addons || [], status: sb.status, next_billing_date: sb.next_billing_date, phone4: digitsOf(sb.phone).slice(-4), linked: safe.subscriber_id === sb.id } : null },
     passes: passes.data, payments: payments.data,
     lockers: lockers.data.map(({ lock_code, ...l }) => l),
     inquiries: inquiries.data, events: events.data, weeks, attTotal: att.data.length, monthVisits: att.data.filter((x) => kstDate(x.checked_at).slice(0, 7) === today.slice(0, 7)).length,
@@ -1836,9 +1985,9 @@ async function tokenOk(tk) {
 }
 
 const ACTIONS = { dashboard, members, member, lockerBoard, kioskRegister, checkinFind, checkin, photoUpload,
-  taskDone, taskUndo, staffList, staffAdd, staffRemove, financeGet, financeSave, salesYear, subSearch, subLink, staffUpdate, rolesSave, report, memoAdd, inquiryAdd, inquiryList, inquiryUpdate, ptBoard, revenue, msgRules, msgRulesSave, ptSession, ptAssign, ptSetLeft, notionSync, passUpdate, paymentMethod, staffOrder, roleColor, taskSnooze, reportV2, attendanceDay, pushKey, pushSubscribe, pushTest, products, register, registerUndo };
+  taskDone, taskUndo, staffList, staffAdd, staffRemove, financeGet, financeSave, salesYear, subSearch, subLink, staffUpdate, rolesSave, report, memoAdd, inquiryAdd, inquiryList, inquiryUpdate, ptBoard, revenue, msgRules, msgRulesSave, ptSession, ptAssign, ptSetLeft, notionSync, passUpdate, paymentMethod, staffOrder, roleColor, taskSnooze, reportV2, attendanceDay, pushKey, pushSubscribe, pushTest, products, register, registerUndo, regInquiries, subLocker };
 const KIOSK_OK = ['checkinFind', 'checkin', 'photoUpload'];
-const WRITES = ['checkin', 'photoUpload', 'taskDone', 'taskUndo', 'staffAdd', 'staffUpdate', 'staffRemove', 'financeSave', 'subLink', 'rolesSave', 'memoAdd', 'inquiryAdd', 'inquiryUpdate', 'msgRulesSave', 'ptSession', 'ptAssign', 'ptSetLeft', 'notionSync', 'passUpdate', 'paymentMethod', 'staffOrder', 'roleColor', 'taskSnooze', 'pushSubscribe', 'pushTest', 'register', 'registerUndo'];
+const WRITES = ['checkin', 'photoUpload', 'taskDone', 'taskUndo', 'staffAdd', 'staffUpdate', 'staffRemove', 'financeSave', 'subLink', 'rolesSave', 'memoAdd', 'inquiryAdd', 'inquiryUpdate', 'msgRulesSave', 'ptSession', 'ptAssign', 'ptSetLeft', 'notionSync', 'passUpdate', 'paymentMethod', 'staffOrder', 'roleColor', 'taskSnooze', 'pushSubscribe', 'pushTest', 'register', 'registerUndo', 'subLocker'];
 
 export default async function handler(req, res) {
   cors(req, res);
