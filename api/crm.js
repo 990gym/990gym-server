@@ -1,6 +1,6 @@
 import { createClient } from '@supabase/supabase-js';
 import crypto from 'crypto';
-import { cors, bearer, verifyToken } from './_auth.js';
+import { cors, bearer, verifyToken, checkPassword, issueToken, passwordConfigured } from './_auth.js';
 import { monthlyAmount, getPromo } from './_pricing.js';
 
 // 990 CRM (보기 전용) — the990.co.kr/crm.html 이 부른다.
@@ -234,7 +234,6 @@ function buildTasks(all, today, inGym, passByMember) {
 // ---------- 대시보드 ----------
 async function dashboard() { return memo('dashboard', 20000, dashboardRaw); }
 async function dashboardRaw() {
-  try { await subSync(); } catch (e) { console.error('subSync', e.message); } // 월구독 자동결제 기록 (10분에 한 번)
   const today = todayKST();
   const month = today.slice(0, 7);
   const recentCut = new Date(Date.parse(today) - 400 * DAY).toISOString().slice(0, 10);
@@ -2115,6 +2114,14 @@ export default async function handler(req, res) {
   // 브로제이 출석 가져오기: 브로제이 화면에서 바로 보내므로 로그인 대신 한 번 쓰는 가져오기 키로 확인
   if (params.action === 'brojImport') {
     try { const [code, body] = await brojImport(params); return res.status(code).json(body); } catch (e) { console.error('brojImport', e); return res.status(500).json({ error: '서버 오류' }); }
+  }
+  // 로그인: 서울 서버에서도 바로 받는다 (미국 서버까지 안 가서 첫 화면이 빨라진다). 토큰은 두 서버가 같이 쓴다.
+  if (params.action === 'login') {
+    try {
+      if (!(await passwordConfigured(supabase))) return res.status(503).json({ error: '비밀번호 설정 없음' });
+      if (!(await checkPassword(supabase, params.password))) { await new Promise((r) => setTimeout(r, 800)); return res.status(401).json({ error: '비밀번호가 올바르지 않습니다.' }); }
+      return res.status(200).json(await issueToken(supabase));
+    } catch (e) { console.error('login', e); return res.status(500).json({ error: '서버 오류' }); }
   }
   if (params.action === 'cron') {
     try { const [code, body] = await cronRun(params); return res.status(code).json(body); } catch (e) { console.error('cron', params.job, e); return res.status(500).json({ error: '서버 오류' }); }
