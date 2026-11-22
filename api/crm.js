@@ -327,6 +327,15 @@ async function dashboardRaw() {
   // 할 일
   const passName = Object.fromEntries(Object.entries(mainPass).map(([id, p]) => [id, p.product_name]));
   const tasks = buildTasks(all, today, inGym, passName);
+  // 기간 락커가 끝났는데 아직 정리(비우기·비밀번호 변경) 안 한 락커 (끝난 뒤 14일 안)
+  const lx = await supabase.from('crm_locker_assignments').select('locker_no,member_id,ends_on,lock_code_changed_at').eq('status', '만료').eq('billing', '기간 결제').gte('ends_on', addDaysYMD(today, -14)).lt('ends_on', today);
+  if (!lx.error) lx.data.forEach((x) => {
+    const m = byId[x.member_id]; if (!m) return;
+    if (assigns.some((a) => a.locker_no === x.locker_no)) return; // 다시 등록했거나 다른 분이 쓰는 중
+    if (x.lock_code_changed_at && kstDate(x.lock_code_changed_at) >= x.ends_on) return;
+    tasks.push({ key: `lockx:${m.id}:${x.ends_on}`, member_id: m.id, name: m.name, phone: m.phone, in_gym: inGym[m.id] || null, kind: '락커', stage: m.stage, tag: `${x.locker_no}번 락커`,
+      title: '락커 기간이 끝났어요 · 짐을 비우고 비밀번호를 바꿔주세요', sub: [`${x.locker_no}번 락커`, `${+x.ends_on.slice(5, 7)}.${+x.ends_on.slice(8)} 만료`], action: '락커 정리 완료', group: '이번 주 안에' });
+  });
   // 구독에 락커 애드온을 넣었는데 아직 락커 번호가 없는 분
   const subLock = new Set(assigns.filter((a) => a.billing === '구독 애드온').map((a) => a.member_id));
   all.forEach((m) => {
@@ -376,9 +385,9 @@ async function dashboardRaw() {
 }
 
 // ---------- 할 일 완료 ----------
-const TASK_KEY = /^(exp|pay|abs14|abs30|nov|new|lapse|inq):[0-9a-f-]{36}:[0-9-]{0,10}$/;
+const TASK_KEY = /^(exp|pay|abs14|abs30|nov|new|lapse|inq|lockx):[0-9a-f-]{36}:[0-9-]{0,10}$/;
 const TASK_RESULTS = ['연락 완료', '문자 보냄', '직접 만남', '재등록 의사 있음', '거절', '안 받음'];
-const TASK_LABEL = { exp: '재등록 안내', pay: '결제 실패 안내', abs14: '미출석 안부', abs30: '장기 미출석 연락', nov: '첫 방문 연락', new: '신규 안부', lapse: '복귀 안내', inq: '리턴 연락' };
+const TASK_LABEL = { exp: '재등록 안내', pay: '결제 실패 안내', abs14: '미출석 안부', abs30: '장기 미출석 연락', nov: '첫 방문 연락', new: '신규 안부', lapse: '복귀 안내', inq: '리턴 연락', lockx: '락커 정리' };
 async function taskSnooze({ key, staff, days = 1 }) {
   if (!TASK_KEY.test(String(key || ''))) return [400, { error: '할 일 정보가 맞지 않아요' }];
   const name = String(staff || '').trim();
@@ -406,6 +415,7 @@ async function taskDone({ key, staff, note, result }) {
   const ins = await supabase.from('crm_tasks').upsert({ task_key: key, member_id, inquiry_id: isInq ? refId : null, kind, due_on: todayKST(), done_at: new Date().toISOString(), done_by: name, result: note ? String(note).slice(0, 300) : null }, { onConflict: 'task_key' });
   if (ins.error) throw ins.error;
   if (isInq) return [200, { success: true }];
+  if (kind === 'lockx') await supabase.from('crm_locker_assignments').update({ lock_code_changed_at: new Date().toISOString() }).eq('member_id', member_id).eq('ends_on', key.split(':')[2]).eq('billing', '기간 결제');
   await supabase.from('crm_events').insert({ member_id, kind: '할 일', body: `${TASK_LABEL[kind]} 완료${note ? ` · ${String(note).slice(0, 300)}` : ''}`, staff_name: name });
   return [200, { success: true }];
 }
@@ -1172,6 +1182,109 @@ async function subLocker({ member_id, locker_no, staff }) {
   clearCache();
   return member({ id: member_id });
 }
+
+// ---------- 예약 작업 (서울 서버 예약 기능이 정해진 시간에 부른다) ----------
+// tick(5분마다): 서버 깨워두기 + 월구독 자동결제 기록 / nightly(매일 0시 5분): 이용권·락커·회원 단계 정리
+// report(매일 밤 10시): 하루 요약 알림 / weekly(월요일 아침 9시): 지난주 요약 알림
+async function cronOk(key) {
+  const { data, error } = await supabase.from('admin_settings').select('value').eq('key', 'cron_secret').maybeSingle();
+  if (error || !data || !data.value || !key) return false;
+  const want = String(data.value.k || data.value), got = String(key);
+  return want.length === got.length && crypto.timingSafeEqual(Buffer.from(want), Buffer.from(got));
+}
+async function cronRun({ job, key }) {
+  if (!(await cronOk(key))) return [401, { error: 'unauthorized' }];
+  const t0 = Date.now(); let out;
+  if (job === 'tick') out = await subSync();
+  else if (job === 'nightly') out = await statusSync();
+  else if (job === 'report') out = await dailyReport();
+  else if (job === 'weekly') out = await weeklyReport();
+  else return [400, { error: '알 수 없는 작업' }];
+  await supabase.from('crm_settings').upsert({ key: `cron_${job}`, value: { at: new Date().toISOString(), ms: Date.now() - t0, out }, updated_at: new Date().toISOString() }, { onConflict: 'key' });
+  return [200, { ok: true, job, ...(out || {}) }];
+}
+const STORED_STAGE = { '체험': '체험·신규', '신규': '체험·신규', '정착': '정착', '미출석': '미출석', '만료 예정': '만료 예정', '만료·이탈': '만료·이탈' };
+async function statusSync() {
+  const today = todayKST(), out = {};
+  const upd = async (label, q) => { const { data, error } = await q.select('id'); if (error) throw error; out[label] = data.length; };
+  // 이용권: 시작일이 되면 사용 중, 끝나는 날이 지나면 만료 (홀딩 중인 것은 그대로)
+  await upd('passStart', supabase.from('crm_passes').update({ status: '사용 중' }).eq('status', '예정').lte('starts_on', today));
+  await upd('passEnd', supabase.from('crm_passes').update({ status: '만료' }).eq('status', '사용 중').lt('ends_on', today));
+  // 기간 락커 (구독 락커는 subSync 가 맞춘다)
+  await upd('lockStart', supabase.from('crm_locker_assignments').update({ status: '사용 중' }).eq('status', '예정').eq('billing', '기간 결제').lte('starts_on', today));
+  await upd('lockEnd', supabase.from('crm_locker_assignments').update({ status: '만료' }).eq('status', '사용 중').eq('billing', '기간 결제').lt('ends_on', today));
+  // 회원 단계 저장값을 오늘 기준으로 (목록·대시보드가 빨라지고 정확해진다)
+  const [ms, S, trialSet] = await Promise.all([selectAll(() => supabase.from('crm_members').select(MEMBER_COLS)), subsMap(), trialOnlySet()]);
+  const live = markTrial(ms.map((m) => decorate(m, today, S)), trialSet);
+  const groups = {};
+  live.forEach((m, i) => { const want = STORED_STAGE[m.stage] || '정착'; if (ms[i].stage !== want) (groups[want] = groups[want] || []).push(m.id); });
+  let changed = 0;
+  for (const [st, ids] of Object.entries(groups)) for (let i = 0; i < ids.length; i += 200) { const { error } = await supabase.from('crm_members').update({ stage: st }).in('id', ids.slice(i, i + 200)); if (error) throw error; changed += Math.min(200, ids.length - i); }
+  out.memberStage = changed;
+  clearCache();
+  return out;
+}
+// 요약 알림은 '설정 → 매일 요약 받기'를 켠 폰에만 보낸다 (매출이 있어서 직원 폰 전체에는 안 보낸다)
+async function reportTargets() {
+  const st = await supabase.from('crm_settings').select('value').eq('key', 'report_push').maybeSingle();
+  const eps = (st.data && st.data.value && st.data.value.endpoints) || [];
+  if (!eps.length) return [];
+  const { data, error } = await supabase.from('crm_push_subs').select('endpoint,p256dh,auth').in('endpoint', eps);
+  if (error) throw error;
+  return data;
+}
+async function pushReport(msg) {
+  const to = await reportTargets();
+  let n = 0; for (const t of to) n += await pushSend(msg, t);
+  return { sent: n, targets: to.length };
+}
+const wonShort = (v) => (v >= 10000 ? `${Math.round(v / 1000) / 10}만원` : `${(v || 0).toLocaleString()}원`);
+const DOW = ['일', '월', '화', '수', '목', '금', '토'];
+async function dailyReport() {
+  const today = todayKST();
+  const startISO = new Date(Date.parse(`${today}T00:00:00+09:00`)).toISOString();
+  const [[, D], pays] = await Promise.all([dashboard(), paymentsRaw(startISO)]);
+  const sum = pays.reduce((a, p) => a + (p.amount || 0), 0), nNew = pays.filter((p) => p.kind === '신규').length, nRe = pays.filter((p) => p.kind === '재등록').length;
+  const open = D.tasks.filter((t) => !t.done).length, doneT = D.doneToday;
+  const pct = D.sales.target ? Math.round(D.sales.total / D.sales.target * 100) : null;
+  const lines = [
+    `매출 ${sum.toLocaleString()}원 · 신규 ${nNew} · 재등록 ${nRe}`,
+    `출석 ${D.attendance.today}명 · 할 일 ${doneT}건 처리, ${open}건 남음`,
+    `이번 달 ${wonShort(D.sales.total)}${pct != null ? ` (목표의 ${pct}%)` : ''} · 만료 예정 ${D.stages['만료 예정'] || 0}명${D.totals.subFail ? ` · 결제 실패 ${D.totals.subFail}명` : ''}`,
+  ];
+  return pushReport({ title: `[990짐] 오늘 마감 · ${+today.slice(5, 7)}/${+today.slice(8)}(${DOW[new Date(`${today}T00:00:00Z`).getUTCDay()]})`, body: lines.join('\n'), tag: `report-${today}` });
+}
+async function weeklyReport() {
+  const today = todayKST();
+  const to = new Date(Date.parse(`${today}T00:00:00+09:00`)), from = new Date(to.getTime() - 7 * DAY);
+  const [pays, inq, [, D]] = await Promise.all([
+    paymentsRaw(from.toISOString(), to.toISOString()),
+    supabase.from('crm_inquiries').select('id,result,member_id').gte('inquired_at', from.toISOString()).lt('inquired_at', to.toISOString()),
+    dashboard(),
+  ]);
+  if (inq.error) throw inq.error;
+  const sum = pays.reduce((a, p) => a + (p.amount || 0), 0), nNew = pays.filter((p) => p.kind === '신규').length, nRe = pays.filter((p) => p.kind === '재등록').length;
+  const qn = inq.data.length, qj = inq.data.filter((q) => q.result === '등록' || q.member_id).length;
+  const soon = D.tasks.filter((t) => t.kind === '재등록' && !t.done).length;
+  const lines = [
+    `매출 ${sum.toLocaleString()}원 · 신규 ${nNew}명 · 재등록 ${nRe}명`,
+    `문의 ${qn}건 → 등록 ${qj}명${qn ? ` (${Math.round(qj / qn * 100)}%)` : ''}`,
+    `이번 주 챙길 분: 만료 예정 ${soon}명 · 미출석 ${D.stages['미출석'] || 0}명`,
+  ];
+  return pushReport({ title: `[990짐] 지난주 요약 · ${+from.toISOString().slice(5, 7)}/${+addDaysYMD(today, -7).slice(8)}~${+addDaysYMD(today, -1).slice(5, 7)}/${+addDaysYMD(today, -1).slice(8)}`, body: lines.join('\n'), tag: `weekly-${today}` });
+}
+// 설정: 이 폰으로 매일 요약 받기
+async function reportPush({ endpoint, on }) {
+  const ep = String(endpoint || ''); if (!/^https:\/\//.test(ep)) return [400, { error: '알림을 먼저 켜 주세요 (위쪽 🔔)' }];
+  const st = await supabase.from('crm_settings').select('value').eq('key', 'report_push').maybeSingle();
+  if (st.error) throw st.error;
+  const eps = new Set((st.data && st.data.value && st.data.value.endpoints) || []);
+  if (on === true) eps.add(ep); else if (on === false) eps.delete(ep);
+  if (on === true || on === false) { const { error } = await supabase.from('crm_settings').upsert({ key: 'report_push', value: { endpoints: [...eps] }, updated_at: new Date().toISOString() }, { onConflict: 'key' }); if (error) throw error; }
+  if (on === 'test') { const sub = await supabase.from('crm_push_subs').select('endpoint,p256dh,auth').eq('endpoint', ep).maybeSingle(); if (sub.data) { const r = await dailyReportMsg(); await pushSend(r, sub.data); } }
+  return [200, { on: eps.has(ep), count: eps.size }];
+}
+async function dailyReportMsg() { const to = await reportTargets(); return { title: '[990짐] 매일 요약 받기가 켜졌어요', body: '매일 밤 10시에 오늘 매출·출석·할 일을 보내드려요', tag: `report-test-${Date.now()}`, _n: to.length }; }
 
 // ---------- 등록·결제 입력 ----------
 async function products() {
@@ -1985,9 +2098,9 @@ async function tokenOk(tk) {
 }
 
 const ACTIONS = { dashboard, members, member, lockerBoard, kioskRegister, checkinFind, checkin, photoUpload,
-  taskDone, taskUndo, staffList, staffAdd, staffRemove, financeGet, financeSave, salesYear, subSearch, subLink, staffUpdate, rolesSave, report, memoAdd, inquiryAdd, inquiryList, inquiryUpdate, ptBoard, revenue, msgRules, msgRulesSave, ptSession, ptAssign, ptSetLeft, notionSync, passUpdate, paymentMethod, staffOrder, roleColor, taskSnooze, reportV2, attendanceDay, pushKey, pushSubscribe, pushTest, products, register, registerUndo, regInquiries, subLocker };
+  taskDone, taskUndo, staffList, staffAdd, staffRemove, financeGet, financeSave, salesYear, subSearch, subLink, staffUpdate, rolesSave, report, memoAdd, inquiryAdd, inquiryList, inquiryUpdate, ptBoard, revenue, msgRules, msgRulesSave, ptSession, ptAssign, ptSetLeft, notionSync, passUpdate, paymentMethod, staffOrder, roleColor, taskSnooze, reportV2, attendanceDay, pushKey, pushSubscribe, pushTest, products, register, registerUndo, regInquiries, subLocker, reportPush };
 const KIOSK_OK = ['checkinFind', 'checkin', 'photoUpload'];
-const WRITES = ['checkin', 'photoUpload', 'taskDone', 'taskUndo', 'staffAdd', 'staffUpdate', 'staffRemove', 'financeSave', 'subLink', 'rolesSave', 'memoAdd', 'inquiryAdd', 'inquiryUpdate', 'msgRulesSave', 'ptSession', 'ptAssign', 'ptSetLeft', 'notionSync', 'passUpdate', 'paymentMethod', 'staffOrder', 'roleColor', 'taskSnooze', 'pushSubscribe', 'pushTest', 'register', 'registerUndo', 'subLocker'];
+const WRITES = ['checkin', 'photoUpload', 'taskDone', 'taskUndo', 'staffAdd', 'staffUpdate', 'staffRemove', 'financeSave', 'subLink', 'rolesSave', 'memoAdd', 'inquiryAdd', 'inquiryUpdate', 'msgRulesSave', 'ptSession', 'ptAssign', 'ptSetLeft', 'notionSync', 'passUpdate', 'paymentMethod', 'staffOrder', 'roleColor', 'taskSnooze', 'pushSubscribe', 'pushTest', 'register', 'registerUndo', 'subLocker', 'reportPush'];
 
 export default async function handler(req, res) {
   cors(req, res);
@@ -2002,6 +2115,9 @@ export default async function handler(req, res) {
   // 브로제이 출석 가져오기: 브로제이 화면에서 바로 보내므로 로그인 대신 한 번 쓰는 가져오기 키로 확인
   if (params.action === 'brojImport') {
     try { const [code, body] = await brojImport(params); return res.status(code).json(body); } catch (e) { console.error('brojImport', e); return res.status(500).json({ error: '서버 오류' }); }
+  }
+  if (params.action === 'cron') {
+    try { const [code, body] = await cronRun(params); return res.status(code).json(body); } catch (e) { console.error('cron', params.job, e); return res.status(500).json({ error: '서버 오류' }); }
   }
   if (params.action === 'attendanceImport') {
     try { const [code, body] = await attendanceImport(params); return res.status(code).json(body); } catch (e) { console.error('attendanceImport', e); return res.status(500).json({ error: '서버 오류' }); }
