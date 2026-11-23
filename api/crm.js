@@ -82,6 +82,7 @@ function liveStage(m, today, ss) {
   return '정착';
 }
 
+const ACTIVE_ST = ['사용 중', '예정', '홀딩'];
 const MEMBER_COLS = 'id,name,phone,gender,usage_tag,stage,holding,first_started_on,ends_on,last_attended_on,total_visits,lifetime_paid,counselor,trainer,source,marketing_consent,memo,subscriber_id';
 
 // 1000줄씩 나눠 받기. 서버(미국)와 DB(도쿄)가 멀어서 한 번에 8쪽씩 동시에 받는다 (8천 줄까지 한 번 왕복).
@@ -753,13 +754,13 @@ async function attendanceDay({ date }) {
   const monthStart = kstStart(`${d.slice(0, 7)}-01`);
   const [mres, pres, ares, subs, trial] = await Promise.all([
     Promise.all(chunks.map((c) => supabase.from('crm_members').select(MEMBER_COLS).in('id', c))),
-    Promise.all(chunks.map((c) => supabase.from('crm_passes').select('member_id,product_name,category,ends_on').in('member_id', c).in('status', ['사용 중', '예정', '홀딩']))),
+    Promise.all(chunks.map((c) => selectAll(() => supabase.from('crm_passes').select('member_id,product_name,category,ends_on,status').in('member_id', c).not('status', 'in', '("무효","환불")')))),
     Promise.all(chunks.map((c) => selectAll(() => supabase.from('crm_attendance').select('member_id,checked_at').in('member_id', c).gte('checked_at', monthStart).lt('checked_at', kstEndEx(d))))),
     subsMap(), trialOnlySet(),
   ]);
   const mem = {}, pass = {}, pt = {}, monthN = {};
   mres.forEach(({ data, error }) => { if (error) throw error; markTrial(data.map((m) => decorate(m, today, subs)), trial).forEach((m) => { mem[m.id] = m; }); });
-  pres.forEach(({ data, error }) => { if (error) throw error; data.forEach((p) => { if (salesGroup(p.product_name, p.category) === 'PT') { pt[p.member_id] = p.product_name; return; } if (!pass[p.member_id] || String(p.ends_on) > String(pass[p.member_id].ends_on)) pass[p.member_id] = p; }); });
+  pres.forEach((data) => { data.forEach((p) => { if (salesGroup(p.product_name, p.category) === 'PT') { if (!pt[p.member_id] || ACTIVE_ST.includes(p.status)) pt[p.member_id] = p.product_name; return; } if (!ACTIVE_ST.includes(p.status)) return; if (!pass[p.member_id] || String(p.ends_on) > String(pass[p.member_id].ends_on)) pass[p.member_id] = p; }); });
   ares.forEach((l) => uniqDays(l).forEach((a) => { monthN[a.member_id] = (monthN[a.member_id] || 0) + 1; }));
   // 한 사람이 여러 번 찍으면 처음 입장 기준 한 줄 + 횟수
   const seen = {}, list = [];
@@ -1780,16 +1781,18 @@ async function withListExtras(rows, today) {
   const monthStart = new Date(Date.parse(`${today.slice(0, 7)}-01T00:00:00+09:00`)).toISOString();
   const chunks = []; for (let i = 0; i < ids.length; i += 150) chunks.push(ids.slice(i, i + 150));
   const [ps, at, firsts] = await Promise.all([
-    Promise.all(chunks.map((c) => supabase.from('crm_passes').select('member_id,product_name,category,ends_on,registered_on').in('member_id', c).in('status', ['사용 중', '예정', '홀딩']))),
+    // PT는 만료가 없다(만료일 = 환불 기한, 남은 횟수는 계속 사용) → PT 이력이 있으면 모두 +PT 표시. 회원권 이름은 살아 있는 것만.
+    Promise.all(chunks.map((c) => selectAll(() => supabase.from('crm_passes').select('member_id,product_name,category,ends_on,registered_on,status').in('member_id', c).not('status', 'in', '("무효","환불")')))),
     Promise.all(chunks.map((c) => selectAll(() => supabase.from('crm_attendance').select('member_id,checked_at').in('member_id', c).gte('checked_at', monthStart)))),
     // 처음 등록한 날 = 문의에서 회원으로 전환된 날 (나중에 PT를 사도 안 바뀜)
     Promise.all(chunks.map((c) => selectAll(() => supabase.from('crm_passes').select('member_id,registered_on').in('member_id', c).neq('status', '무효')))),
   ]);
   const passName = {}, ptName = {}, visits = {}, regOn = {};
   firsts.forEach((d) => d.forEach((p) => { if (p.registered_on && p.registered_on <= today && (!regOn[p.member_id] || p.registered_on < regOn[p.member_id])) regOn[p.member_id] = p.registered_on; }));
-  ps.forEach(({ data: d, error: e }) => { if (e) throw e; d.forEach((p) => {
+  ps.forEach((d) => { d.forEach((p) => {
     const g = salesGroup(p.product_name, p.category);
-    if (g === 'PT') { ptName[p.member_id] = p.product_name; return; }
+    if (g === 'PT') { if (!ptName[p.member_id] || ACTIVE_ST.includes(p.status)) ptName[p.member_id] = p.product_name; return; }
+    if (!ACTIVE_ST.includes(p.status)) return;
     if (!passName[p.member_id] || String(p.ends_on) > String(passName[p.member_id].ends_on)) passName[p.member_id] = p;
   }); });
   at.forEach((d) => uniqDays(d).forEach((a) => { visits[a.member_id] = (visits[a.member_id] || 0) + 1; }));
