@@ -183,11 +183,12 @@ async function passesByIds(ids, known = {}) {
   for (const { data, error } of res) { if (error) throw error; data.forEach((p) => { out[p.id] = p; }); }
   return out;
 }
-const paymentsRaw = (fromISO, toISO) => selectAll(() => { let q = supabase.from('crm_payments').select('id,amount,paid_at,pass_id,member_id,kind,method,method_split,method_note').gte('paid_at', fromISO); if (toISO) q = q.lt('paid_at', toISO); return q; });
+// 매출: '매출에서 뺌'(sales_excluded) 표시된 결제는 빼고 센다
+const paymentsRaw = (fromISO, toISO) => selectAll(() => { let q = supabase.from('crm_payments').select('id,amount,paid_at,pass_id,member_id,kind,method,method_split,method_note,item').not('sales_excluded', 'is', true).gte('paid_at', fromISO); if (toISO) q = q.lt('paid_at', toISO); return q; });
 async function paymentsWithGroup(fromISO, known, toISO, pre) {
   const pays = pre || await paymentsRaw(fromISO, toISO);
   const pm = await passesByIds(pays.map((p) => p.pass_id), known);
-  return pays.map((p) => { const ps = pm[p.pass_id] || {}; return { ...p, day: kstDate(p.paid_at), group: salesGroup(ps.product_name, ps.category) }; });
+  return pays.map((p) => { const ps = pm[p.pass_id] || {}; return { ...p, day: kstDate(p.paid_at), group: salesGroup(ps.product_name || p.item, ps.category) }; }); // 이용권 없는 결제(매출장에서 넣은 것)는 항목 이름으로 나눈다
 }
 
 // ---------- 오늘 할 일 ----------
@@ -338,7 +339,8 @@ async function dashboardRaw() {
       title: '락커 기간이 끝났어요 · 짐을 비우고 비밀번호를 바꿔주세요', sub: [`${x.locker_no}번 락커`, `${+x.ends_on.slice(5, 7)}.${+x.ends_on.slice(8)} 만료`], action: '락커 정리 완료', group: '이번 주 안에' });
   });
   // 구독에 락커 애드온을 넣었는데 아직 락커 번호가 없는 분
-  const subLock = new Set(assigns.filter((a) => a.billing === '구독 애드온').map((a) => a.member_id));
+  // 락커가 이미 배정돼 있으면(브로제이에서 가져온 '기간 결제' 락커 포함) 할 일에 안 띄운다
+  const subLock = new Set(assigns.filter((a) => ['사용 중', '예정', '홀딩'].includes(a.status || '사용 중')).map((a) => a.member_id));
   all.forEach((m) => {
     const sb = subOf(m, subs);
     if (!sb || !['active', 'paused'].includes(sb.status) || !(sb.addons || []).includes('locker') || subLock.has(m.id)) return;
@@ -607,7 +609,7 @@ async function revenue({ period = 'month' }) {
     Promise.all([paymentsRaw(kstStart(from), kstEndEx(to)), allPassesCached()]).then(([pr, ap]) => paymentsWithGroup(null, Object.fromEntries(ap.map((x) => [x.id, x])), null, pr)),
     getFinance(),
     supabase.from('subscribers').select('name,plan,status,next_billing_date'),
-    supabase.from('crm_payments').select('id,amount,paid_at,pass_id,member_id,kind,method,method_split,method_note').order('paid_at', { ascending: false }).limit(8),
+    supabase.from('crm_payments').select('id,amount,paid_at,pass_id,member_id,kind,method,method_split,method_note,item').not('sales_excluded', 'is', true).order('paid_at', { ascending: false }).limit(8),
   ]);
   if (subs.error || recent.error) throw subs.error || recent.error;
   const total = pays.reduce((a, p) => a + p.amount, 0);
@@ -618,12 +620,12 @@ async function revenue({ period = 'month' }) {
   // 목록: 오늘 결제, 없으면 최근 결제
   const listSrc = pays.filter((p) => p.day === today);
   const pick = listSrc.length ? listSrc : recent.data;
-  const mids = [...new Set(pick.map((p) => p.member_id))];
+  const mids = [...new Set(pick.map((p) => p.member_id).filter(Boolean))];
   const nm = {};
   const [pm, nres] = await Promise.all([passesByIds(pick.map((p) => p.pass_id)), mids.length ? supabase.from('crm_members').select('id,name').in('id', mids) : { data: [] }]);
   if (nres.error) throw nres.error;
   nres.data.forEach((m) => { nm[m.id] = m.name; });
-  const list = pick.map((p) => ({ id: p.id, method: p.method || null, split: p.method_split || null, note: p.method_note || null, name: nm[p.member_id] || '-', member_id: p.member_id, amount: p.amount, kind: p.kind, product: (pm[p.pass_id] || {}).product_name || '-', group: salesGroup((pm[p.pass_id] || {}).product_name, (pm[p.pass_id] || {}).category), at: p.paid_at }));
+  const list = pick.map((p) => ({ id: p.id, method: p.method || null, split: p.method_split || null, note: p.method_note || null, name: p.member_id ? nm[p.member_id] || '-' : '비회원', member_id: p.member_id || null, amount: p.amount, kind: p.kind, product: (pm[p.pass_id] || {}).product_name || p.item || '-', group: salesGroup((pm[p.pass_id] || {}).product_name || p.item, (pm[p.pass_id] || {}).category), at: p.paid_at }));
   const days = Math.round((Date.parse(to) - Date.parse(from)) / DAY) + 1;
   // 결제 방법 (월구독은 토스 자동결제라 뺀다)
   const methods = {}; PAY_METHODS.concat(['미입력']).forEach((k) => { methods[k] = { amount: 0, count: 0 }; });
@@ -1862,7 +1864,7 @@ async function member({ id }) {
   const [m, passes, payments, lockers, inquiries, events, att, S] = await Promise.all([
     supabase.from('crm_members').select('*').eq('id', id).maybeSingle(),
     supabase.from('crm_passes').select('id,product_name,category,status,starts_on,ends_on,total_count,remaining_count,trainer,price_paid,registered_on,legacy_id').eq('member_id', id).order('starts_on', { ascending: true }),
-    supabase.from('crm_payments').select('id,amount,kind,method,method_split,method_note,staff_name,paid_at,pass_id').eq('member_id', id).order('paid_at', { ascending: true }),
+    supabase.from('crm_payments').select('id,amount,kind,method,method_split,method_note,staff_name,paid_at,pass_id,item,sales_excluded').eq('member_id', id).order('paid_at', { ascending: true }),
     supabase.from('crm_locker_assignments').select('locker_no,status,starts_on,ends_on,price_paid,billing').eq('member_id', id).order('starts_on', { ascending: true }),
     supabase.from('crm_inquiries').select('inquired_at,raw_note,result').eq('member_id', id).order('inquired_at', { ascending: true }),
     supabase.from('crm_events').select('kind,body,staff_name,at').eq('member_id', id).order('at', { ascending: false }).limit(30),
