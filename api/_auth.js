@@ -127,5 +127,6 @@ export function cors(req, res, methods = 'POST, OPTIONS') {
   res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', methods);
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Max-Age', '7200'); // 브라우저가 사전 확인(OPTIONS)을 2시간 기억 → 누를 때마다 한 번 더 오가지 않게
   res.setHeader('Cache-Control', 'no-store');
 }

@@ -2189,7 +2189,9 @@ export default async function handler(req, res) {
   const kiosk = KIOSK_OK.includes(params.action) && isKiosk(tk);
   if (!kiosk && !(await tokenOk(tk))) return res.status(401).json({ error: '로그인이 필요해요' });
   try {
+    const t0 = Date.now();
     const [code, body] = await fn(params);
+    console.log(`[시간] ${params.action} ${Date.now() - t0}ms`); // 어느 화면이 느린지 기록에서 본다
     return res.status(code).json(body);
   } catch (e) {
     console.error('crm', params.action, e);
