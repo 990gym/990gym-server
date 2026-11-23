@@ -644,6 +644,47 @@ async function revenue({ period = 'month' }) {
     list, listIsToday: listSrc.length > 0 }];
 }
 
+// ---------- 날짜별 등록 내역 (최신 날짜부터, 하루 단위로 끊어서 '더 보기') ----------
+// before: 이 날짜 '전'까지 (YYYY-MM-DD, 없으면 오늘까지) · date: 이 날짜부터 거꾸로 · filter: all | 신규 | 재등록 | 복귀 | 환불 | nosub(월구독 자동결제 빼기)
+async function salesDays({ before = '', date = '', filter = 'all' } = {}) {
+  const today = todayKST(), YMD = /^\d{4}-\d{2}-\d{2}$/;
+  const end = YMD.test(date) ? addDaysYMD(date, 1) : YMD.test(before) ? before : addDaysYMD(today, 1); // 이 날 0시 전까지
+  const LIMIT = 150;
+  let q = supabase.from('crm_payments').select('id,amount,paid_at,pass_id,member_id,kind,method,method_split,method_note,item')
+    .not('sales_excluded', 'is', true).lt('paid_at', kstStart(end)).order('paid_at', { ascending: false }).limit(LIMIT);
+  if (['신규', '재등록', '복귀', '추가', '환불'].includes(filter)) q = q.eq('kind', filter);
+  const { data, error } = await q;
+  if (error) throw error;
+  const dayOf = (iso) => new Date(Date.parse(iso) + 9 * 3600e3).toISOString().slice(0, 10);
+  let rows = data, next = null;
+  if (data.length === LIMIT) {
+    const last = dayOf(data[data.length - 1].paid_at);
+    const cut = data.filter((x) => dayOf(x.paid_at) !== last);
+    // 마지막 날은 잘렸을 수 있어서 다음 쪽에서 통째로 보여준다 (하루가 혼자 150건을 넘으면 그대로)
+    if (cut.length) { rows = cut; next = addDaysYMD(last, 1); } else next = last;
+  }
+  if (filter === 'nosub') rows = rows.filter((x) => !/^토스 자동결제/.test(x.method_note || ''));
+  const mids = [...new Set(rows.map((x) => x.member_id).filter(Boolean))];
+  const [pm, mres] = await Promise.all([passesByIds(rows.map((x) => x.pass_id)),
+    mids.length ? supabase.from('crm_members').select('id,name').in('id', mids) : { data: [] }]);
+  if (mres.error) throw mres.error;
+  const nm = Object.fromEntries((mres.data || []).map((m) => [m.id, m.name]));
+  const days = [], byDay = {};
+  rows.forEach((x) => {
+    const d = dayOf(x.paid_at), ps = pm[x.pass_id] || {};
+    const product = ps.product_name || x.item || '-';
+    const auto = /^토스 자동결제/.test(x.method_note || '');
+    if (!byDay[d]) { byDay[d] = { day: d, total: 0, count: 0, items: [] }; days.push(byDay[d]); }
+    byDay[d].total += x.amount; byDay[d].count++;
+    const group = salesGroup(product, ps.category);
+    // PT 3회 9.9만 = 체험 PT
+    const trial = group === 'PT' && (x.amount === 99000 || /체험/.test(product));
+    byDay[d].items.push({ id: x.id, name: x.member_id ? nm[x.member_id] || '-' : '비회원', member_id: x.member_id || null, kind: x.kind, product, trial,
+      group, amount: x.amount, method: x.method || null, split: x.method_split || null, note: auto ? null : (x.method_note || null), auto });
+  });
+  return [200, { today, days, next }];
+}
+
 // ---------- 보고서 v2 (월 + 주차, 크마스터처럼 보기 쉽게) ----------
 const isTrialName = (nm) => /체험|^PT ?3회$/.test(nm || '');
 function monthWeeks(ym) {
@@ -2109,7 +2150,7 @@ async function tokenOk(tk) {
   return ok;
 }
 
-const ACTIONS = { dashboard, members, member, lockerBoard, kioskRegister, checkinFind, checkin, photoUpload,
+const ACTIONS = { dashboard, members, member, salesDays, lockerBoard, kioskRegister, checkinFind, checkin, photoUpload,
   taskDone, taskUndo, staffList, staffAdd, staffRemove, financeGet, financeSave, salesYear, subSearch, subLink, staffUpdate, rolesSave, report, memoAdd, inquiryAdd, inquiryList, inquiryUpdate, ptBoard, revenue, msgRules, msgRulesSave, ptSession, ptAssign, ptSetLeft, notionSync, passUpdate, paymentMethod, staffOrder, roleColor, taskSnooze, reportV2, attendanceDay, pushKey, pushSubscribe, pushTest, products, register, registerUndo, regInquiries, subLocker, reportPush };
 const KIOSK_OK = ['checkinFind', 'checkin', 'photoUpload'];
 const WRITES = ['checkin', 'photoUpload', 'taskDone', 'taskUndo', 'staffAdd', 'staffUpdate', 'staffRemove', 'financeSave', 'subLink', 'rolesSave', 'memoAdd', 'inquiryAdd', 'inquiryUpdate', 'msgRulesSave', 'ptSession', 'ptAssign', 'ptSetLeft', 'notionSync', 'passUpdate', 'paymentMethod', 'staffOrder', 'roleColor', 'taskSnooze', 'pushSubscribe', 'pushTest', 'register', 'registerUndo', 'subLocker', 'reportPush'];
