@@ -41,7 +41,7 @@ function subOf(m, S) {
   if (!S) return null;
   if (m.subscriber_id && S.byId[m.subscriber_id]) return S.byId[m.subscriber_id];
   const p = digitsOf(m.phone), n = String(m.name || '').trim();
-  if (p && S.byPN[`${p}|${n}`]) return S.byPN[`${p}|${n}`];
+  if (p && S.byPN[`${p}|${n}`] && !(S.linked && S.linked.has(S.byPN[`${p}|${n}`].id))) return S.byPN[`${p}|${n}`]; // 가족이 대신 내주는 구독: 실제 쓰는 회원에게 연결돼 있으면 결제한 사람에게는 안 붙인다
   const byN = S.byName[n];
   if (byN && byN.length === 1 && !(S.linked && S.linked.has(byN[0].id))) return byN[0];
   const byP = p && S.byPhone[p];
