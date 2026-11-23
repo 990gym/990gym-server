@@ -83,7 +83,9 @@ function liveStage(m, today, ss) {
 }
 
 const ACTIVE_ST = ['사용 중', '예정', '홀딩'];
-const MEMBER_COLS = 'id,name,phone,gender,usage_tag,stage,holding,first_started_on,ends_on,last_attended_on,total_visits,lifetime_paid,counselor,trainer,source,marketing_consent,memo,subscriber_id';
+// 브로제이 이름 꼬리표 (PT+헬스 등)에 PT가 있으면 PT 이력이 있는 회원 (이용권 기록이 남지 않은 옛 PT 회원)
+const hasPtTag = (m) => !!(m && m.pt_history) || /PT/i.test((m && m.usage_tag) || '');
+const MEMBER_COLS = 'id,name,phone,gender,usage_tag,pt_history,stage,holding,first_started_on,ends_on,last_attended_on,total_visits,lifetime_paid,counselor,trainer,source,marketing_consent,memo,subscriber_id';
 
 // 1000줄씩 나눠 받기. 서버(미국)와 DB(도쿄)가 멀어서 한 번에 8쪽씩 동시에 받는다 (8천 줄까지 한 번 왕복).
 async function selectAll(build) {
@@ -769,7 +771,7 @@ async function attendanceDay({ date }) {
     if (seen[r.member_id]) { seen[r.member_id].times.push(t); seen[r.member_id].last_at = r.checked_at; return; }
     const m = mem[r.member_id] || {};
     const row = { member_id: r.member_id, name: m.name || '-', stage: m.stage || null, sub: m.sub || null, holding: !!m.holding, days_left: m.days_left ?? null, next_billing: m.next_billing || null,
-      pass: pass[r.member_id] ? pass[r.member_id].product_name : (m.usage_tag || null), pt: pt[r.member_id] || null, times: [t], first_at: r.checked_at, last_at: r.checked_at, month: monthN[r.member_id] || 1 };
+      pass: pass[r.member_id] ? pass[r.member_id].product_name : (m.usage_tag || null), pt: pt[r.member_id] || (hasPtTag(m) ? 'PT' : null), times: [t], first_at: r.checked_at, last_at: r.checked_at, month: monthN[r.member_id] || 1 };
     seen[r.member_id] = row; list.push(row);
   });
   const nowMs = Date.now();
@@ -1780,12 +1782,14 @@ async function withListExtras(rows, today) {
   const ids = rows.map((m) => m.id);
   const monthStart = new Date(Date.parse(`${today.slice(0, 7)}-01T00:00:00+09:00`)).toISOString();
   const chunks = []; for (let i = 0; i < ids.length; i += 150) chunks.push(ids.slice(i, i + 150));
-  const [ps, at, firsts] = await Promise.all([
+  const [ps, at, firsts, ptPays] = await Promise.all([
     // PT는 만료가 없다(만료일 = 환불 기한, 남은 횟수는 계속 사용) → PT 이력이 있으면 모두 +PT 표시. 회원권 이름은 살아 있는 것만.
     Promise.all(chunks.map((c) => selectAll(() => supabase.from('crm_passes').select('member_id,product_name,category,ends_on,registered_on,status').in('member_id', c).not('status', 'in', '("무효","환불")')))),
     Promise.all(chunks.map((c) => selectAll(() => supabase.from('crm_attendance').select('member_id,checked_at').in('member_id', c).gte('checked_at', monthStart)))),
     // 처음 등록한 날 = 문의에서 회원으로 전환된 날 (나중에 PT를 사도 안 바뀜)
     Promise.all(chunks.map((c) => selectAll(() => supabase.from('crm_passes').select('member_id,registered_on').in('member_id', c).neq('status', '무효')))),
+    // 이용권 없이 매출장에만 있는 PT 결제도 PT 이력으로 본다
+    Promise.all(chunks.map((c) => selectAll(() => supabase.from('crm_payments').select('member_id,item').in('member_id', c).like('item', 'PT%')))),
   ]);
   const passName = {}, ptName = {}, visits = {}, regOn = {};
   firsts.forEach((d) => d.forEach((p) => { if (p.registered_on && p.registered_on <= today && (!regOn[p.member_id] || p.registered_on < regOn[p.member_id])) regOn[p.member_id] = p.registered_on; }));
@@ -1796,7 +1800,8 @@ async function withListExtras(rows, today) {
     if (!passName[p.member_id] || String(p.ends_on) > String(passName[p.member_id].ends_on)) passName[p.member_id] = p;
   }); });
   at.forEach((d) => uniqDays(d).forEach((a) => { visits[a.member_id] = (visits[a.member_id] || 0) + 1; }));
-  return rows.map((m) => ({ ...m, pass_name: passName[m.id] ? passName[m.id].product_name : null, pt_name: ptName[m.id] || null, month_visits: visits[m.id] || 0, registered_on: [regOn[m.id], m.first_started_on].filter(Boolean).sort()[0] || null }));
+  ptPays.forEach((d) => d.forEach((p) => { if (!ptName[p.member_id]) ptName[p.member_id] = 'PT'; }));
+  return rows.map((m) => ({ ...m, pass_name: passName[m.id] ? passName[m.id].product_name : null, pt_name: ptName[m.id] || (hasPtTag(m) ? 'PT' : null), month_visits: visits[m.id] || 0, registered_on: [regOn[m.id], m.first_started_on].filter(Boolean).sort()[0] || null }));
 }
 async function members({ q = '', stage = '', limit = 60, offset = 0, sort = '', dir = '' }) {
   const today = todayKST();
