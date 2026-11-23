@@ -20,12 +20,14 @@ const daysBetween = (a, b) => Math.round((Date.parse(b) - Date.parse(a)) / DAY);
 const digitsOf = (p) => String(p || '').replace(/\D/g, '');
 async function subsMap() { return memo('subs', 180000, subsMapRaw); }
 async function subsMapRaw() {
-  const [subs, bj] = await Promise.all([
+  const [subs, bj, linked] = await Promise.all([
     supabase.from('subscribers').select('id,name,phone,plan,addons,status,next_billing_date,cancelled_at,paused_at,created_at').order('created_at', { ascending: true }),
     selectAll(() => supabase.from('crm_passes').select('member_id').in('status', ['사용 중', '예정', '홀딩']).ilike('product_name', '%구독%')),
+    supabase.from('crm_members').select('subscriber_id').not('subscriber_id', 'is', null),
   ]);
   if (subs.error) throw subs.error;
-  const S = { byId: {}, byPN: {}, byName: {}, byPhone: {}, bj: new Set(bj.map((r) => r.member_id)) };
+  // 이미 어느 회원과 연결된 구독은 이름·번호만 같은 다른 회원(동명이인)에게 붙이지 않는다
+  const S = { byId: {}, byPN: {}, byName: {}, byPhone: {}, bj: new Set(bj.map((r) => r.member_id)), linked: new Set(((linked && linked.data) || []).map((r) => r.subscriber_id)) };
   (subs.data || []).forEach((r) => {
     const p = digitsOf(r.phone), n = String(r.name || '').trim();
     S.byId[r.id] = r;
@@ -41,9 +43,9 @@ function subOf(m, S) {
   const p = digitsOf(m.phone), n = String(m.name || '').trim();
   if (p && S.byPN[`${p}|${n}`]) return S.byPN[`${p}|${n}`];
   const byN = S.byName[n];
-  if (byN && byN.length === 1) return byN[0];
+  if (byN && byN.length === 1 && !(S.linked && S.linked.has(byN[0].id))) return byN[0];
   const byP = p && S.byPhone[p];
-  if (byP && ['active', 'payment_failed'].includes(byP.status)) return byP;
+  if (byP && ['active', 'payment_failed'].includes(byP.status) && !(S.linked && S.linked.has(byP.id))) return byP;
   return null;
 }
 // 월구독 상태: 자동결제 중이면 만료 계산을 안 하고, 해지 신청·결제 실패만 끝나는 날을 본다
@@ -1115,6 +1117,7 @@ async function recordSubPayment(t, members) {
   if (ex.error) throw ex.error;
   if (ex.data.length) return false; // 이미 기록함
   let m = memberForSub(s, members);
+  if (m && !m.subscriber_id) { await supabase.from('crm_members').update({ subscriber_id: s.id }).eq('id', m.id); m.subscriber_id = s.id; }
   if (!m) { // 홈페이지에서 처음 가입한 분 → CRM 회원으로 만든다
     const phone = normPhone(s.phone);
     const ins = await supabase.from('crm_members').insert({ name: String(s.name || '이름 없음').slice(0, 30), phone, stage: '체험·신규', checkin_code: digitsOf(phone).slice(-4), source: '990홈페이지', subscriber_id: s.id }).select('id,name,phone,subscriber_id,lifetime_paid,legacy_id').single();
