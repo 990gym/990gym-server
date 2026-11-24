@@ -2270,6 +2270,16 @@ async function staffPunch({ phone }) {
   if (!dup) await pushToLeads({ title: `[990짐] ${s.name}님 ${kind} · ${kstHM(at)}`, body: kind === '퇴근' ? `오늘 총 ${minsTxt(worked)}` : (s.role || '직원'), tag: `work-${now}` });
   return [200, { name: s.name, role: s.role || null, kind, at, dup, worked_min: worked }];
 }
+// 입실 태블릿 '직원 호출' → 직원 폰 전체로 알림. 20초 안에 또 누른 건 한 번으로 친다.
+async function staffCall() {
+  const prev = await supabase.from('crm_settings').select('value').eq('key', 'staff_call').maybeSingle();
+  const last = prev.data && prev.data.value && Date.parse(prev.data.value.at) || 0;
+  if (Date.now() - last < 20000) return [200, { ok: true, again: true }];
+  const at = new Date().toISOString();
+  await supabase.from('crm_settings').upsert({ key: 'staff_call', value: { at }, updated_at: at }, { onConflict: 'key' });
+  await pushSend({ title: `[990짐] 🔔 직원 호출 · ${kstHM(at)}`, body: '입실 태블릿에서 직원을 찾고 있어요', tag: `call-${Date.now()}`, call: true });
+  return [200, { ok: true, again: false }];
+}
 // 출근부: 한 달 치 기록 + 직원별 근무시간. 퇴근 안 찍은 지난 날 = missing (근무시간에 안 넣음)
 async function staffAttendance({ month }) {
   const today = todayKST();
@@ -2347,9 +2357,9 @@ async function tokenOk(tk) {
   return ok;
 }
 
-const ACTIONS = { dashboard, members, member, salesDays, lockerBoard, kioskRegister, checkinFind, checkin, photoUpload, staffPunch, staffAttendance, staffAttendanceSave,
+const ACTIONS = { dashboard, members, member, salesDays, lockerBoard, kioskRegister, checkinFind, checkin, photoUpload, staffPunch, staffCall, staffAttendance, staffAttendanceSave,
   taskDone, taskUndo, staffList, staffAdd, staffRemove, financeGet, financeSave, salesYear, subSearch, subLink, staffUpdate, rolesSave, report, memoAdd, inquiryAdd, inquiryList, inquiryUpdate, ptBoard, revenue, msgRules, msgRulesSave, ptSession, ptAssign, ptSetLeft, notionSync, passUpdate, paymentMethod, staffOrder, roleColor, taskSnooze, reportV2, attendanceDay, pushKey, pushSubscribe, pushTest, products, register, registerUndo, regInquiries, subLocker, reportPush };
-const KIOSK_OK = ['checkinFind', 'checkin', 'photoUpload', 'staffPunch'];
+const KIOSK_OK = ['checkinFind', 'checkin', 'photoUpload', 'staffPunch', 'staffCall'];
 const WRITES = ['checkin', 'photoUpload', 'taskDone', 'taskUndo', 'staffAdd', 'staffUpdate', 'staffRemove', 'financeSave', 'subLink', 'rolesSave', 'memoAdd', 'inquiryAdd', 'inquiryUpdate', 'msgRulesSave', 'ptSession', 'ptAssign', 'ptSetLeft', 'notionSync', 'passUpdate', 'paymentMethod', 'staffOrder', 'roleColor', 'taskSnooze', 'pushSubscribe', 'pushTest', 'register', 'registerUndo', 'subLocker', 'reportPush'];
 
 export default async function handler(req, res) {
