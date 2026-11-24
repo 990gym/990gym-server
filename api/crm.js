@@ -1178,17 +1178,27 @@ async function subSync({ force = false } = {}) {
   if (!force && cfg.at && Date.now() - Date.parse(cfg.at) < SUB_SYNC_EVERY) return { skipped: true };
   const { data: subs, error } = await supabase.from('subscribers').select('id,name,phone,plan,addons,status,promo,next_billing_date,created_at');
   if (error) throw error;
-  const seen = { ...(cfg.seen || {}) }, todo = [], today = todayKST();
+  const seen = { ...(cfg.seen || {}) }, seenSt = { ...(cfg.seenSt || {}) }, todo = [], today = todayKST();
   for (const s of subs) {
     const prev = seen[s.id], nb = s.next_billing_date;
     if (cfg.enabled) {
       if (prev === undefined) {
         if (cfg.from && kstDate(s.created_at) >= cfg.from) { const pr = getPromo(s.plan, s.promo); todo.push({ s, first: true, day: kstDate(s.created_at), at: s.created_at, amount: pr ? pr.firstAmount : monthlyAmount(s.plan, s.addons) }); }
-      } else if (prev && nb && nb > prev) {
-        for (let d = prev, i = 0; d < nb && i < 12; d = addOneMonth(d), i++) todo.push({ s, first: false, day: d, at: new Date(Date.parse(`${d}T09:00:00+09:00`)).toISOString(), amount: monthlyAmount(s.plan, s.addons) });
+      } else if (prev && nb && nb > prev && s.status !== 'paused') {
+        // '복구'를 누르면 그날 한 번 결제되고 다음 결제일이 그날+1달이 된다 → 밀린 달까지 세지 말고 한 건만 기록.
+        // 해지했던 분이 복구하거나 한 달 넘게 결제가 비었다가 복구 = '복귀'. 며칠 안 된 결제 실패(서버 문제 등) 후 복구는 평소 결제와 같게(재등록) 본다.
+        const prevSt = (cfg.seenSt || {})[s.id];
+        const restored = s.status === 'active' && ((prevSt && !['active', 'paused'].includes(prevSt)) || nb > addOneMonth(prev));
+        if (restored) {
+          const d = addDaysYMD(ymdAddMonths(nb, -1), 1);
+          todo.push({ s, first: false, restored: true, comeback: prevSt === 'cancelled' || nb > addOneMonth(addOneMonth(prev)), day: d, at: new Date(Date.parse(`${d}T09:00:00+09:00`)).toISOString(), amount: monthlyAmount(s.plan, s.addons) });
+        } else {
+          for (let d = prev, i = 0; d < nb && i < 12; d = addOneMonth(d), i++) todo.push({ s, first: false, day: d, at: new Date(Date.parse(`${d}T09:00:00+09:00`)).toISOString(), amount: monthlyAmount(s.plan, s.addons) });
+        }
       }
     }
     if (nb) seen[s.id] = nb;
+    seenSt[s.id] = s.status;
   }
   let recorded = 0;
   const logs = [];
@@ -1200,7 +1210,7 @@ async function subSync({ force = false } = {}) {
     }
   }
   await subLockerSync(subs, today);
-  const { error: e2 } = await supabase.from('crm_settings').upsert({ key: 'sub_sync', value: { ...cfg, at: new Date().toISOString(), seen, last: { recorded, errors: logs.slice(0, 5) } }, updated_at: new Date().toISOString() }, { onConflict: 'key' });
+  const { error: e2 } = await supabase.from('crm_settings').upsert({ key: 'sub_sync', value: { ...cfg, at: new Date().toISOString(), seen, seenSt, last: { recorded, errors: logs.slice(0, 5) } }, updated_at: new Date().toISOString() }, { onConflict: 'key' });
   if (e2) throw e2;
   if (recorded) clearCache();
   return { recorded, errors: logs };
@@ -1218,7 +1228,7 @@ async function recordSubPayment(t, members) {
     if (ins.error) throw ins.error;
     m = ins.data; members.push(m);
   }
-  const kind = await regKind(m.id, `${s.plan} 구독권`, '월구독', t.amount, t.day);
+  const kind = t.comeback ? '복귀' : await regKind(m.id, `${s.plan} 구독권`, '월구독', t.amount, t.day);
   const end = addDaysYMD(addOneMonth(t.day), -1), today = todayKST();
   const pass = await supabase.from('crm_passes').insert({ member_id: m.id, product_name: `${s.plan} 구독권`, category: '월구독', status: end < today ? '만료' : t.day > today ? '예정' : '사용 중', starts_on: t.day, ends_on: end, price_paid: t.amount, registered_on: t.day }).select('id').single();
   if (pass.error) throw pass.error;
@@ -1228,7 +1238,7 @@ async function recordSubPayment(t, members) {
   await supabase.from('crm_members').update({ lifetime_paid: life, updated_at: new Date().toISOString() }).eq('id', m.id);
   m.lifetime_paid = life;
   await syncMemberEnd(m.id);
-  await supabase.from('crm_events').insert({ member_id: m.id, kind: '월구독 결제', body: `${t.first ? '첫 결제' : '자동결제'} · ${s.plan}${(s.addons || []).length ? ` + ${(s.addons || []).map((a) => (a === 'locker' ? '락커' : a === 'wear' ? '운동복' : a)).join('·')}` : ''} · ${t.amount.toLocaleString()}원 · ${t.day} ~ ${end}` });
+  await supabase.from('crm_events').insert({ member_id: m.id, kind: '월구독 결제', body: `${t.first ? '첫 결제' : t.restored ? '복구 결제' : '자동결제'} · ${s.plan}${(s.addons || []).length ? ` + ${(s.addons || []).map((a) => (a === 'locker' ? '락커' : a === 'wear' ? '운동복' : a)).join('·')}` : ''} · ${t.amount.toLocaleString()}원 · ${t.day} ~ ${end}` });
   return true;
 }
 // 구독 락커(애드온): 결제된 날까지 쓰게 끝나는 날을 맞추고, 구독이 끝나면 락커도 끝낸다
