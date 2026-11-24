@@ -486,8 +486,17 @@ async function contactUpdate({ key, result, next_on }) {
 }
 async function taskUndo({ key }) {
   if (!TASK_KEY.test(String(key || ''))) return [400, { error: '할 일 정보가 맞지 않아요' }];
-  const del = await supabase.from('crm_tasks').delete().eq('task_key', key).gte('done_at', new Date(Date.parse(`${todayKST()}T00:00:00+09:00`)).toISOString());
+  const dayStart = new Date(Date.parse(`${todayKST()}T00:00:00+09:00`)).toISOString();
+  const row = await supabase.from('crm_tasks').select('member_id,kind,method,done_at').eq('task_key', key).gte('done_at', dayStart).maybeSingle();
+  const del = await supabase.from('crm_tasks').delete().eq('task_key', key).gte('done_at', dayStart);
   if (del.error) throw del.error;
+  // 되돌리면 회원 이력에 남긴 줄도 같이 지운다 (안 그러면 안 한 연락이 이력에 남는다)
+  if (row.data && row.data.member_id && TASK_LABEL[row.data.kind]) {
+    const ev = await supabase.from('crm_events').select('id,body,at').eq('member_id', row.data.member_id).in('kind', ['연락', '할 일']).gte('at', dayStart).order('at', { ascending: false }).limit(5);
+    const head = `${row.data.method ? `${row.data.method} · ` : ''}${TASK_LABEL[row.data.kind]}`;
+    const hit = (ev.data || []).find((e) => String(e.body || '').startsWith(head));
+    if (hit && hit.id != null) await supabase.from('crm_events').delete().eq('id', hit.id);
+  }
   return [200, { success: true }];
 }
 
@@ -1036,6 +1045,7 @@ async function todayQueue() {
   let scheduled = 0;
   e.rows.forEach((r) => {
     const c = r.contacted, cDay = c ? dayKST(c.at) : null, doneToday = cDay === today;
+    if (doneToday && !/^rv:/.test(c.key)) return; // 오늘 다른 할 일(결제 실패 안내 등)로 이미 연락한 분
     let again = false;
     if (c && !doneToday) {
       if (c.next_on) { if (c.next_on > today) { scheduled++; return; } again = true; } // 다음 연락일 전까지는 쉰다
@@ -1045,7 +1055,7 @@ async function todayQueue() {
     const due = r.in_gym || r.d_left <= 3 ? 'now' : again || r.d_left <= 14 || r.v60 === 0 ? 'today' : 'week';
     const how = r.v60 === 0 ? '두 달 동안 한 번도 안 오셨어요' : `두 달 동안 ${r.v60}번 오셨어요`;
     const act = r.in_gym ? '직접 인사하고 다음 방문 약속 잡기' : r.v60 === 0 ? '안부 전화로 이번 주 방문 약속 잡기' : r.v60 <= 4 ? '방문 약속 문자 보내기' : '재등록 상담하기';
-    items.push({ key: doneToday && /^rv:/.test(c.key) ? c.key : `rv:${r.member_id}:${today}`, kind: 'renew', member_id: r.member_id, name: r.name, phone: r.phone, in_gym: r.in_gym,
+    items.push({ key: doneToday ? c.key : `rv:${r.member_id}:${today}`, kind: 'renew', member_id: r.member_id, name: r.name, phone: r.phone, in_gym: r.in_gym,
       d_left: r.d_left, v60: r.v60, verb: r.in_gym ? 'meet' : r.v60 === 0 ? 'call' : r.v60 <= 4 ? 'text' : 'meet',
       tag: again ? '다시 연락하는 날' : r.d_left === 0 ? '오늘 끝나요' : `D-${r.d_left}`, why: `${r.product} · ${how}`, action: act, stake: r.risk, stake_est: r.est,
       basis: { of10: Math.round(r.p / 10), n: r.basis_n }, due,
