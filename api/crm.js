@@ -2061,7 +2061,7 @@ async function member({ id }) {
   const [m, passes, payments, lockers, inquiries, events, att, S] = await Promise.all([
     supabase.from('crm_members').select('*').eq('id', id).maybeSingle(),
     supabase.from('crm_passes').select('id,product_name,category,status,starts_on,ends_on,total_count,remaining_count,trainer,price_paid,registered_on,legacy_id').eq('member_id', id).order('starts_on', { ascending: true }),
-    supabase.from('crm_payments').select('id,amount,kind,method,method_split,method_note,staff_name,paid_at,pass_id,item,sales_excluded').eq('member_id', id).order('paid_at', { ascending: true }),
+    supabase.from('crm_payments').select('id,amount,list_price,discount_reason,kind,method,method_split,method_note,staff_name,paid_at,pass_id,item,sales_excluded').eq('member_id', id).order('paid_at', { ascending: true }),
     supabase.from('crm_locker_assignments').select('locker_no,status,starts_on,ends_on,price_paid,billing').eq('member_id', id).order('starts_on', { ascending: true }),
     supabase.from('crm_inquiries').select('inquired_at,raw_note,result').eq('member_id', id).order('inquired_at', { ascending: true }),
     supabase.from('crm_events').select('kind,body,staff_name,at').eq('member_id', id).order('at', { ascending: false }).limit(30),
