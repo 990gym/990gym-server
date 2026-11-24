@@ -865,6 +865,35 @@ async function attendanceDay({ date }) {
   return [200, { date: d, today, total: rows.length, people: list.length, now: list.filter((x) => x.in_gym).length, hours, list }];
 }
 
+// ---------- 브로제이 회원 사진 가져오기 (한 번) ----------
+// items: [{ phone, name, image(jpeg base64) }]  전화번호로 회원을 찾고, 이미 사진이 있는 회원은 건드리지 않는다
+async function photoImport({ key, items }) {
+  const st = await supabase.from('crm_settings').select('value').eq('key', 'att_import').maybeSingle();
+  if (st.error) throw st.error;
+  const v = st.data && st.data.value;
+  if (!v || !key || v.key !== key || Date.now() > Date.parse(v.expires)) return [401, { error: '가져오기 키가 맞지 않거나 끝났어요' }];
+  if (!Array.isArray(items) || items.length > 30) return [400, { error: '한 번에 30장까지예요' }];
+  const members = await selectAll(() => supabase.from('crm_members').select('id,name,phone,photo_path'));
+  const byPhone = {}; members.forEach((m) => { const d = String(m.phone || '').replace(/\D/g, ''); if (d) (byPhone[d] = byPhone[d] || []).push(m); });
+  const out = { saved: 0, had: 0, nomatch: 0, bad: 0, names: [] };
+  for (const it of items) {
+    const d = String(it.phone || '').replace(/\D/g, ''); const nm = String(it.name || '').replace(/\(.*?\)/g, '').trim();
+    const list = byPhone[d] || [];
+    const m = list.length === 1 ? list[0] : list.find((x) => String(x.name || '').replace(/\(.*?\)/g, '').trim() === nm);
+    if (!m) { out.nomatch++; continue; }
+    if (m.photo_path) { out.had++; continue; }
+    const buf = Buffer.from(String(it.image || '').replace(/^data:image\/jpeg;base64,/, ''), 'base64');
+    if (buf.length < 2000 || buf.length > 1024 * 1024 || buf[0] !== 0xff || buf[1] !== 0xd8) { out.bad++; continue; }
+    const path = `${m.id}.jpg`;
+    const up = await supabase.storage.from(PHOTO_BUCKET).upload(path, buf, { contentType: 'image/jpeg', upsert: true });
+    if (up.error) throw up.error;
+    const u = await supabase.from('crm_members').update({ photo_path: path, photo_taken_at: new Date().toISOString() }).eq('id', m.id).is('photo_path', null);
+    if (u.error) throw u.error;
+    m.photo_path = path; out.saved++;
+  }
+  return [200, out];
+}
+
 // ---------- 브로제이 출석 가져오기 ----------
 // rows: [[전화번호, 입장 시각(ms), 브로제이 출석 번호], ...]  같은 출석 번호는 한 번만 들어간다
 async function attendanceImport({ key, rows }) {
@@ -2386,6 +2415,9 @@ export default async function handler(req, res) {
   }
   if (params.action === 'cron') {
     try { const [code, body] = await cronRun(params); return res.status(code).json(body); } catch (e) { console.error('cron', params.job, e); return res.status(500).json({ error: '서버 오류' }); }
+  }
+  if (params.action === 'photoImport') {
+    try { const [code, body] = await photoImport(params); return res.status(code).json(body); } catch (e) { console.error('photoImport', e); return res.status(500).json({ error: '서버 오류' }); }
   }
   if (params.action === 'tossTx') {
     try { const [code, body] = await tossTx(params); return res.status(code).json(body); } catch (e) { console.error('tossTx', e); return res.status(500).json({ error: '서버 오류' }); }
