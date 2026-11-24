@@ -1391,9 +1391,9 @@ async function reportTargets() {
   const st = await supabase.from('crm_settings').select('value').eq('key', 'report_push').maybeSingle();
   const eps = (st.data && st.data.value && st.data.value.endpoints) || [];
   if (!eps.length) return [];
-  const { data, error } = await supabase.from('crm_push_subs').select('endpoint,p256dh,auth').in('endpoint', eps);
+  const [{ data, error }, pp] = await Promise.all([supabase.from('crm_push_subs').select('endpoint,p256dh,auth,staff_name').in('endpoint', eps), pushPeople()]);
   if (error) throw error;
-  return data;
+  return data.filter((x) => !x.staff_name || pp.leads.has(x.staff_name)); // 매출 요약은 대표·매니저 폰만
 }
 async function pushReport(msg) {
   const to = await reportTargets();
@@ -1441,6 +1441,11 @@ async function reportPush({ endpoint, on }) {
   const st = await supabase.from('crm_settings').select('value').eq('key', 'report_push').maybeSingle();
   if (st.error) throw st.error;
   const eps = new Set((st.data && st.data.value && st.data.value.endpoints) || []);
+  if (on === true) {
+    const [me, pp] = await Promise.all([supabase.from('crm_push_subs').select('staff_name').eq('endpoint', ep).maybeSingle(), pushPeople()]);
+    const who = me.data && me.data.staff_name;
+    if (who && !pp.leads.has(who)) return [403, { error: '매일 요약은 대표·매니저 폰만 받을 수 있어요' }];
+  }
   if (on === true) eps.add(ep); else if (on === false) eps.delete(ep);
   if (on === true || on === false) { const { error } = await supabase.from('crm_settings').upsert({ key: 'report_push', value: { endpoints: [...eps] }, updated_at: new Date().toISOString() }, { onConflict: 'key' }); if (error) throw error; }
   if (on === 'test') { const sub = await supabase.from('crm_push_subs').select('endpoint,p256dh,auth').eq('endpoint', ep).maybeSingle(); if (sub.data) { const r = await dailyReportMsg(); await pushSend(r, sub.data); } }
@@ -1749,6 +1754,7 @@ async function staffUpdate({ id, name, role, phone }) {
   if (cur.data.name !== n) {
     const t = await supabase.from('crm_tasks').update({ done_by: n }).eq('done_by', cur.data.name);
     if (t.error) throw t.error;
+    await supabase.from('crm_push_subs').update({ staff_name: n }).eq('staff_name', cur.data.name); // 알림 폰 주인 이름도 같이
   }
   return staffList();
 }
@@ -2162,14 +2168,32 @@ async function pushSubscribe({ sub, staff, device, off }) {
   if (error) throw error;
   return [200, { ok: true }];
 }
+// 이 폰이 누구 폰인지 (CRM 화면에서 확인용)
+async function pushWho({ endpoint }) {
+  const ep = String(endpoint || ''); if (!ep) return [200, { known: false }];
+  const [me, pp] = await Promise.all([supabase.from('crm_push_subs').select('staff_name').eq('endpoint', ep).maybeSingle(), pushPeople()]);
+  if (me.error) throw me.error;
+  if (!me.data) return [200, { known: false }];
+  const n = me.data.staff_name;
+  return [200, { known: true, staff_name: n || null, lead: !n || pp.leads.has(n), active: !n || pp.active.has(n) }];
+}
+// 알림 받는 폰 구분: 폰 주인(직원 명단 이름)의 직책으로 나눈다.
+// 대표·매니저 = 모든 알림, 다른 직원 = 입실 알림·직원 호출만, 명단에서 빠진 직원 = 안 보냄. 주인을 아직 안 고른 예전 폰은 모두 받는다.
+const isLeadRole = (r) => /대표|매니저|실장/.test(r || '');
+async function pushPeople() {
+  const { data, error } = await supabase.from('crm_staff').select('name,role').eq('active', true);
+  if (error) throw error;
+  return { active: new Set(data.map((x) => x.name)), leads: new Set(data.filter((x) => isLeadRole(x.role)).map((x) => x.name)) };
+}
 // 알림 보내기: 등록된 폰 전부 (한 곳만 고르면 only). 2초 넘게 안 기다린다. 없어진 폰은 지운다.
 async function pushSend(msg, only) {
   try {
     const [{ default: webpush }, v, subs] = await Promise.all([
       import('web-push'), vapid(),
-      only ? Promise.resolve({ data: [only] }) : supabase.from('crm_push_subs').select('endpoint,p256dh,auth'),
+      only ? Promise.resolve({ data: [only] }) : supabase.from('crm_push_subs').select('endpoint,p256dh,auth,staff_name'),
     ]);
-    const list = (subs.data || []).filter((x) => x && x.endpoint);
+    let list = (subs.data || []).filter((x) => x && x.endpoint);
+    if (!only) { const pp = await pushPeople(); list = list.filter((x) => !x.staff_name || pp.active.has(x.staff_name)); } // 명단에서 빠진 직원 폰은 안 보냄
     if (!list.length) return 0;
     const body = JSON.stringify(msg);
     const opt = { vapidDetails: { subject: 'https://the990.co.kr', publicKey: v.publicKey, privateKey: v.privateKey }, TTL: 3600, timeout: 2000 };
@@ -2261,12 +2285,8 @@ const minsOf = (r) => (r.in_at && r.out_at ? Math.max(0, Math.round((Date.parse(
 const kstHM = (iso) => new Date(Date.parse(iso) + 9 * 3600e3).toISOString().slice(11, 16);
 // 출퇴근 알림은 대표·매니저 폰으로 (폰 주인을 모르는 기존 등록 폰도 받는다)
 async function pushToLeads(msg) {
-  const [subs, st] = await Promise.all([
-    supabase.from('crm_push_subs').select('endpoint,p256dh,auth,staff_name'),
-    supabase.from('crm_staff').select('name,role').eq('active', true),
-  ]);
-  const leads = new Set((st.data || []).filter((x) => /대표|매니저|실장/.test(x.role || '')).map((x) => x.name));
-  const list = (subs.data || []).filter((x) => !x.staff_name || leads.has(x.staff_name));
+  const [subs, pp] = await Promise.all([supabase.from('crm_push_subs').select('endpoint,p256dh,auth,staff_name'), pushPeople()]);
+  const list = (subs.data || []).filter((x) => !x.staff_name || pp.leads.has(x.staff_name));
   await Promise.all(list.map((x) => pushSend(msg, x)));
 }
 async function staffPunch({ phone }) {
@@ -2391,7 +2411,7 @@ async function tokenOk(tk) {
 }
 
 const ACTIONS = { dashboard, members, member, salesDays, lockerBoard, kioskRegister, checkinFind, checkin, photoUpload, staffPunch, staffCall, staffAttendance, staffAttendanceSave,
-  taskDone, taskUndo, staffList, staffAdd, staffRemove, financeGet, financeSave, salesYear, subSearch, subLink, staffUpdate, rolesSave, report, memoAdd, inquiryAdd, inquiryList, inquiryUpdate, ptBoard, revenue, msgRules, msgRulesSave, ptSession, ptAssign, ptSetLeft, notionSync, passUpdate, paymentMethod, staffOrder, roleColor, taskSnooze, reportV2, attendanceDay, pushKey, pushSubscribe, pushTest, products, register, registerUndo, regInquiries, subLocker, reportPush };
+  taskDone, taskUndo, staffList, staffAdd, staffRemove, financeGet, financeSave, salesYear, subSearch, subLink, staffUpdate, rolesSave, report, memoAdd, inquiryAdd, inquiryList, inquiryUpdate, ptBoard, revenue, msgRules, msgRulesSave, ptSession, ptAssign, ptSetLeft, notionSync, passUpdate, paymentMethod, staffOrder, roleColor, taskSnooze, reportV2, attendanceDay, pushKey, pushSubscribe, pushTest, pushWho, products, register, registerUndo, regInquiries, subLocker, reportPush };
 const KIOSK_OK = ['checkinFind', 'checkin', 'photoUpload', 'staffPunch', 'staffCall'];
 const WRITES = ['checkin', 'photoUpload', 'taskDone', 'taskUndo', 'staffAdd', 'staffUpdate', 'staffRemove', 'financeSave', 'subLink', 'rolesSave', 'memoAdd', 'inquiryAdd', 'inquiryUpdate', 'msgRulesSave', 'ptSession', 'ptAssign', 'ptSetLeft', 'notionSync', 'passUpdate', 'paymentMethod', 'staffOrder', 'roleColor', 'taskSnooze', 'pushSubscribe', 'pushTest', 'register', 'registerUndo', 'subLocker', 'reportPush'];
 
