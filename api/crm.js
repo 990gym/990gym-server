@@ -637,7 +637,8 @@ async function revenue({ period = 'month' }) {
   const groups = { PT: 0, 헬스: 0, GX: 0, 월구독: 0, 기타: 0 };
   pays.forEach((p) => { groups[p.group] += p.amount; });
   const daily = {}; pays.forEach((p) => { daily[p.day] = (daily[p.day] || 0) + p.amount; });
-  const fails = (subs.data || []).filter((x) => x.status === 'payment_failed' && x.next_billing_date && daysBetween(x.next_billing_date, today) <= 30);
+  // 결제 실패 후 2주가 지나면 이탈로 본다 (할 일의 '만료 예정' 14일과 같게)
+  const fails = (subs.data || []).filter((x) => x.status === 'payment_failed' && x.next_billing_date && daysBetween(x.next_billing_date, today) <= 14);
   // 목록: 오늘 결제, 없으면 최근 결제
   const listSrc = pays.filter((p) => p.day === today);
   const pick = listSrc.length ? listSrc : recent.data;
