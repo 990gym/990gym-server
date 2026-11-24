@@ -689,7 +689,8 @@ async function salesDays({ before = '', date = '', filter = 'all', maxDays = 0 }
   const days = [], byDay = {};
   rows.forEach((x) => {
     const d = dayOf(x.paid_at), ps = pm[x.pass_id] || {};
-    const product = ps.product_name || x.item || '-';
+    // 월구독에 락커·운동복이 붙은 결제는 item 에 '베이직 구독권 + 락커' 처럼 적어 둔다
+    const product = (x.item && /구독/.test(x.item)) ? x.item : (ps.product_name || x.item || '-');
     const group = salesGroup(product, ps.category);
     const auto = /^토스 자동결제/.test(x.method_note || '') || group === '월구독'; // 월구독은 모두 자동결제
     if (!byDay[d]) { byDay[d] = { day: d, total: 0, count: 0, items: [] }; days.push(byDay[d]); }
@@ -1232,7 +1233,8 @@ async function recordSubPayment(t, members) {
   const end = addDaysYMD(addOneMonth(t.day), -1), today = todayKST();
   const pass = await supabase.from('crm_passes').insert({ member_id: m.id, product_name: `${s.plan} 구독권`, category: '월구독', status: end < today ? '만료' : t.day > today ? '예정' : '사용 중', starts_on: t.day, ends_on: end, price_paid: t.amount, registered_on: t.day }).select('id').single();
   if (pass.error) throw pass.error;
-  const pay = await supabase.from('crm_payments').insert({ member_id: m.id, pass_id: pass.data.id, list_price: t.amount, amount: t.amount, method: '카드', method_note: note, kind, paid_at: t.at });
+  const addonTxt = (s.addons || []).map((a) => (a === 'locker' ? '락커' : a === 'wear' ? '운동복' : a)).join('·');
+  const pay = await supabase.from('crm_payments').insert({ member_id: m.id, pass_id: pass.data.id, list_price: t.amount, amount: t.amount, method: '카드', method_note: note, kind, paid_at: t.at, item: addonTxt ? `${s.plan} 구독권 + ${addonTxt}` : null });
   if (pay.error) { await supabase.from('crm_passes').delete().eq('id', pass.data.id); throw pay.error; }
   const life = (Number(m.lifetime_paid) || 0) + t.amount;
   await supabase.from('crm_members').update({ lifetime_paid: life, updated_at: new Date().toISOString() }).eq('id', m.id);
