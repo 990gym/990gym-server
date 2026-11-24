@@ -797,6 +797,17 @@ async function reportV2({ ym, week }) {
   const dayCnt = new Set(aIn.map((x) => kstDate(x.checked_at))).size;
   // ⑥ 왜 그런가 (경로·미등록 사유·해지 사유)
   const src = {}; qIn.forEach((q) => { const k = q.source || '기록 없음'; const o = (src[k] = src[k] || { source: k, count: 0, joined: 0 }); o.count++; if (q.result === '등록') o.joined++; });
+  // 노션에는 '등록'인데 CRM에 결제·이용권이 아직 없는 분 (브로제이 반영 전) — 보고서에서 빠지지 않게 따로 보여준다
+  const digits = (v) => String(v || '').replace(/\D/g, '');
+  const nameKeys = (v) => { const raw = String(v || ''); const inner = (raw.match(/\(([^)]*)\)/) || [])[1]; return [bare(raw), bare(inner)].filter((k) => k && k.length >= 2); };
+  const since120 = iso(Date.parse(end) - 120 * DAY);
+  const pendingReg = inqs.filter((q) => q.result === '등록' && inR(kstDate(q.inquired_at), since120, end)).filter((q) => {
+    const d = kstDate(q.inquired_at), ph = digits(q.phone), keys = nameKeys(q.name);
+    const mids = members.filter((x) => x.id === q.member_id || (ph && digits(x.phone) === ph) || keys.includes(bare(x.name))).map((x) => x.id);
+    const after = iso(Date.parse(d) - 3 * DAY);
+    return !mids.some((mid) => (byMember[mid] || []).some((x) => !isTrialName(x.product_name) && (x.registered_on || x.starts_on || '') >= after));
+  }).map((q) => ({ name: q.name, day: kstDate(q.inquired_at), source: q.source || null, interest: parseInqSummary(q.summary).interest || null }))
+    .sort((a, b) => b.day.localeCompare(a.day));
   const noReg = {}; qIn.forEach((q) => { const r = parseInqSummary(q.summary).reason; if (r) noReg[r] = (noReg[r] || 0) + 1; });
   const churn = {}; (subs.data || []).filter((x) => x.status === 'cancelled' && x.cancelled_at && inR(kstDate(x.cancelled_at), from, end) && x.churn_reason && !/테스트|복구/.test(x.churn_reason)).forEach((x) => { const k = String(x.churn_reason).slice(0, 14); churn[k] = (churn[k] || 0) + 1; });
   return [200, {
@@ -804,7 +815,7 @@ async function reportV2({ ym, week }) {
     members: { now: sNow, prev: sPrev, trials: Object.entries(trials).map(([name, count]) => ({ name, count })).sort((a, b) => b.count - a.count) },
     sales: { total: sum(pIn), prev: sum(pPrev), count: pIn.length, groups, refund: 0, top: Object.values(top).sort((a, b) => b.amount - a.amount).slice(0, 5) },
     funnel: { inquiries: qIn.length, trial: trialList.length, regular: regList.length, renewed, ended: endedDone, endedAll: renewList.length, fromInq, trialConv: trialList.filter((t) => t.state === '전환 완료').length, returned: returnedN,
-      lists: { 유입: inqList, 체험: trialList, 정규: regList, 재등록: renewList } },
+      lists: { 유입: inqList, 체험: trialList, 정규: regList, 재등록: renewList }, pendingReg },
     trend,
     attendance: { visits: aIn.length, visitors: new Set(aIn.map((x) => x.member_id)).size, prevVisits: aPrev.length, perDay: dayCnt ? Math.round(aIn.length / dayCnt * 10) / 10 : 0, peakHour: aIn.length ? hours.indexOf(Math.max(...hours)) : null, days: dayCnt },
     why: { sources: Object.values(src).sort((a, b) => b.count - a.count), noReg: Object.entries(noReg).sort((a, b) => b[1] - a[1]), churn: Object.entries(churn).sort((a, b) => b[1] - a[1]).slice(0, 6) },
