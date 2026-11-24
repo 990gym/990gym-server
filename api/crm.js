@@ -153,6 +153,23 @@ function salesGroup(name, cat) {
   return '기타';
 }
 const MEMBERSHIP = ['헬스', '월구독', 'GX', '기타'];
+// 신규·재등록 기준: 예전에 등록한 적 있으면 재등록. PT는 처음 PT면 신규 (체험 PT 3회 9.9만은 셈에서 뺀다)
+const isTrialPT = (name, price) => salesGroup(name) === 'PT' && (Number(price) === 99000 || /체험/.test(String(name || '')));
+const isAddonName = (name, cat) => cat === '부가' || /락커|운동복|수건/.test(String(name || ''));
+async function regKind(memberId, name, cat, price, beforeDay) {
+  if (!memberId) return '신규';
+  const isPT = salesGroup(name, cat) === 'PT';
+  if (isPT && isTrialPT(name, price)) return '신규';
+  const [ps, mm] = await Promise.all([
+    supabase.from('crm_passes').select('product_name,category,price_paid,registered_on,starts_on').eq('member_id', memberId).not('status', 'in', '("무효","환불")'),
+    supabase.from('crm_members').select('pt_history').eq('id', memberId).maybeSingle(),
+  ]);
+  if (ps.error) throw ps.error;
+  const prev = ps.data.filter((x) => !isAddonName(x.product_name, x.category) && !isTrialPT(x.product_name, x.price_paid)
+    && (!beforeDay || !(x.registered_on || x.starts_on) || (x.registered_on || x.starts_on) < beforeDay));
+  if (isPT) return (mm.data && mm.data.pt_history) || prev.some((x) => salesGroup(x.product_name, x.category) === 'PT') ? '재등록' : '신규';
+  return prev.length ? '재등록' : '신규';
+}
 const kstDate = (iso) => new Date(Date.parse(iso) + 9 * 3600e3).toISOString().slice(0, 10);
 const kstHour = (iso) => new Date(Date.parse(iso) + 9 * 3600e3).getUTCHours();
 
@@ -851,6 +868,33 @@ async function attendanceImport({ key, rows }) {
   return [200, { saved: out.length, unmatched: Object.values(miss).reduce((a, b) => a + b, 0), unmatchedPhones: Object.keys(miss).length }];
 }
 
+// 토스 결제 기록 조회 (읽기 전용) — 같은 1회용 키 사용. 미국 서버에만 토스 키가 있다.
+// 결과는 crm_settings 'toss_tx' 에 그대로 보관해 CRM 결제와 비교한다 (CRM 결제는 건드리지 않음)
+async function tossTx({ key, from, to }) {
+  const st = await supabase.from('crm_settings').select('value').eq('key', 'att_import').maybeSingle();
+  if (st.error) throw st.error;
+  const v = st.data && st.data.value;
+  if (!v || !key || v.key !== key || Date.now() > Date.parse(v.expires)) return [401, { error: '가져오기 키가 맞지 않거나 끝났어요' }];
+  if (!process.env.TOSS_SECRET_KEY) return [503, { error: '이 서버에는 토스 키가 없어요' }];
+  const ymd = /^\d{4}-\d{2}-\d{2}$/;
+  if (!ymd.test(String(from)) || !ymd.test(String(to))) return [400, { error: '날짜 형식' }];
+  const auth = `Basic ${Buffer.from(process.env.TOSS_SECRET_KEY + ':').toString('base64')}`;
+  const all = []; let after = null;
+  for (let i = 0; i < 50; i++) {
+    const qs = new URLSearchParams({ startDate: `${from}T00:00:00`, endDate: `${to}T23:59:59`, limit: '100' });
+    if (after) qs.set('startingAfter', after);
+    const r = await fetch(`https://api.tosspayments.com/v1/transactions?${qs}`, { headers: { Authorization: auth } });
+    const d = await r.json().catch(() => null);
+    if (!r.ok || !Array.isArray(d)) return [502, { error: (d && d.message) || '토스 조회 실패' }];
+    d.forEach((t) => all.push({ tk: t.transactionKey, pk: t.paymentKey, order: t.orderId, ck: t.customerKey, method: t.method, status: t.status, at: t.transactionAt, amount: t.amount }));
+    if (d.length < 100) break;
+    after = d[d.length - 1].transactionKey;
+  }
+  const up = await supabase.from('crm_settings').upsert({ key: 'toss_tx', value: { from, to, fetched_at: new Date().toISOString(), rows: all }, updated_at: new Date().toISOString() }, { onConflict: 'key' });
+  if (up.error) throw up.error;
+  return [200, { count: all.length, sum: all.reduce((a, t) => a + (Number(t.amount) || 0), 0) }];
+}
+
 // 브로제이 원본 보관 (매출내역·회원·이용권·락커·메모 등) — 같은 1회용 키 사용
 const BROJ_KINDS = ['sales', 'members', 'passes', 'lockers', 'memos', 'holds'];
 async function brojImport({ key, kind, rows }) {
@@ -1174,9 +1218,7 @@ async function recordSubPayment(t, members) {
     if (ins.error) throw ins.error;
     m = ins.data; members.push(m);
   }
-  const prevSub = await supabase.from('crm_passes').select('product_name,category').eq('member_id', m.id).not('status', 'in', '("무효","환불")');
-  if (prevSub.error) throw prevSub.error;
-  const kind = prevSub.data.some((x) => salesGroup(x.product_name, x.category) === '월구독') ? '재등록' : '신규';
+  const kind = await regKind(m.id, `${s.plan} 구독권`, '월구독', t.amount, t.day);
   const end = addDaysYMD(addOneMonth(t.day), -1), today = todayKST();
   const pass = await supabase.from('crm_passes').insert({ member_id: m.id, product_name: `${s.plan} 구독권`, category: '월구독', status: end < today ? '만료' : t.day > today ? '예정' : '사용 중', starts_on: t.day, ends_on: end, price_paid: t.amount, registered_on: t.day }).select('id').single();
   if (pass.error) throw pass.error;
@@ -1412,14 +1454,9 @@ async function register({ inquiry_id, member_id, new_member, product_id, custom,
     if (!ex.data) return [404, { error: '회원을 찾을 수 없어요' }];
     const again = await recentSame(mid, prod.name, s, amt); if (again) return again; // 두 번 눌렀거나 다시 보낸 경우
   }
-  // 신규·재등록: 직원이 고르지 않으면 같은 종류(헬스·GX·PT…)를 전에 산 적 있는지로 정한다 (브로제이와 같은 기준)
+  // 신규·재등록: 직원이 고르지 않으면 regKind 기준 (예전에 등록했으면 재등록, PT는 처음 PT면 신규·체험 PT 제외)
   let k = ['신규', '재등록'].includes(kind) ? kind : null;
-  if (!k) {
-    const prev = created ? { data: [] } : await supabase.from('crm_passes').select('product_name,category').eq('member_id', mid).not('status', 'in', '("무효","환불")');
-    if (prev.error) throw prev.error;
-    const g = salesGroup(prod.name, prod.category);
-    k = prev.data.some((x) => salesGroup(x.product_name, x.category) === g) ? '재등록' : '신규';
-  }
+  if (!k) k = created ? '신규' : await regKind(mid, prod.name, prod.category, amt, null);
   // 5) 이용권 → 결제 → 락커 (중간에 실패하면 만든 것을 지운다)
   const undo = [];
   try {
@@ -2183,6 +2220,9 @@ export default async function handler(req, res) {
   }
   if (params.action === 'cron') {
     try { const [code, body] = await cronRun(params); return res.status(code).json(body); } catch (e) { console.error('cron', params.job, e); return res.status(500).json({ error: '서버 오류' }); }
+  }
+  if (params.action === 'tossTx') {
+    try { const [code, body] = await tossTx(params); return res.status(code).json(body); } catch (e) { console.error('tossTx', e); return res.status(500).json({ error: '서버 오류' }); }
   }
   if (params.action === 'attendanceImport') {
     try { const [code, body] = await attendanceImport(params); return res.status(code).json(body); } catch (e) { console.error('attendanceImport', e); return res.status(500).json({ error: '서버 오류' }); }
