@@ -2222,6 +2222,7 @@ async function members({ q = '', stage = '', limit = 60, offset = 0, sort = '', 
     ['체험', '신규', '정착', '미출석', '만료 예정'].forEach((k) => { counts[k] = live.filter((m) => m.stage === k).length; });
     if (stage === '월구독') rows = live.filter(isSub);
     else if (stage === '홀딩') rows = live.filter((m) => m.holding);
+    else if (stage === '유지') rows = live.filter((m) => m.stage === '정착' || m.stage === '미출석'); // 숫자 > 고객 흐름의 '유지' 칸과 같은 사람들
     else if (stage) rows = live.filter((m) => m.stage === stage);
     else rows = live;
   } else {
