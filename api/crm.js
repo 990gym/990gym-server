@@ -1004,6 +1004,7 @@ async function renewEngine({ refresh } = {}) {
   Object.values(cur).forEach((p) => {
     if (p.ends_on < today || p.ends_on > horizon) return;
     const m = mById[p.member_id], set = att[p.member_id];
+    if (m.holding || p.status === '홀딩') return; // 쉬는 중인 분에게는 방문 연락을 올리지 않는다
     const v60 = countIn(set, addDaysYMD(today, -60), today), v14 = countIn(set, addDaysYMD(today, -14), today);
     const dLeft = daysBetween(today, p.ends_on), band = bandOf(v60), c0 = cell(dLeft, band), prob = c0.p;
     // 걸린 돈 = 이 회원이 낸 금액 → 없으면 같은 상품 가운데값 → 없으면 재등록 가운데값 (추정 표시)
@@ -1588,6 +1589,20 @@ async function statusSync() {
   // 이용권: 시작일이 되면 사용 중, 끝나는 날이 지나면 만료 (홀딩 중인 것은 그대로)
   await upd('passStart', supabase.from('crm_passes').update({ status: '사용 중' }).eq('status', '예정').lte('starts_on', today));
   await upd('passEnd', supabase.from('crm_passes').update({ status: '만료' }).eq('status', '사용 중').lt('ends_on', today));
+  // 홀딩: 시작일이 되면 '홀딩', 끝나는 날이 지나면 다시 '사용 중' (끝나는 날이 없는 옛 홀딩은 그대로 둔다)
+  {
+    const hs = await selectAll(() => supabase.from('crm_holds').select('pass_id,starts_on,ends_on').gte('starts_on', addDaysYMD(today, -400)));
+    const openBy = {}, datedBy = {};
+    hs.forEach((h) => { if (h.starts_on <= today && (!h.ends_on || h.ends_on >= today)) openBy[h.pass_id] = true; if (h.ends_on) datedBy[h.pass_id] = true; });
+    const hp = await selectAll(() => supabase.from('crm_passes').select('id,member_id,status').in('status', ['사용 중', '홀딩']));
+    const toHold = hp.filter((p) => p.status === '사용 중' && openBy[p.id]), toUse = hp.filter((p) => p.status === '홀딩' && !openBy[p.id] && datedBy[p.id]);
+    for (const [st, list] of [['홀딩', toHold], ['사용 중', toUse]]) for (let i = 0; i < list.length; i += 200) { const { error } = await supabase.from('crm_passes').update({ status: st }).in('id', list.slice(i, i + 200).map((p) => p.id)); if (error) throw error; }
+    const on = [...new Set(toHold.map((p) => p.member_id))], stillHeld = new Set(hp.filter((p) => (p.status === '홀딩' && !toUse.includes(p)) || toHold.includes(p)).map((p) => p.member_id)), off = [...new Set(toUse.map((p) => p.member_id))].filter((id) => !stillHeld.has(id));
+    if (on.length) { const { error } = await supabase.from('crm_members').update({ holding: true }).in('id', on); if (error) throw error; }
+    if (off.length) { const { error } = await supabase.from('crm_members').update({ holding: false }).in('id', off); if (error) throw error;
+      const lu = await supabase.from('crm_locker_assignments').update({ status: '사용 중' }).eq('status', '홀딩').in('member_id', off); if (lu.error) throw lu.error; }
+    out.holdStart = toHold.length; out.holdEnd = toUse.length;
+  }
   // 기간 락커 (구독 락커는 subSync 가 맞춘다)
   await upd('lockStart', supabase.from('crm_locker_assignments').update({ status: '사용 중' }).eq('status', '예정').eq('billing', '기간 결제').lte('starts_on', today));
   await upd('lockEnd', supabase.from('crm_locker_assignments').update({ status: '만료' }).eq('status', '사용 중').eq('billing', '기간 결제').lt('ends_on', today));
@@ -2273,6 +2288,85 @@ async function memberAttendance({ id, month }) {
   if (error) throw error;
   return [200, { month: ym, rows: data.map((r) => ({ at: r.checked_at, via: r.via || null })), total: cnt.count || 0, first, last }];
 }
+// ---------- 홀딩 · 기간 연장 (원자는 그대로: '이용권'의 끝나는 날을 미루는 일) ----------
+// 홀딩 = 쉬는 날수만큼 이용권 끝나는 날을 뒤로 민다. 일찍 풀면 안 쓴 날수만큼 다시 당긴다. PT는 만료가 없어서 대상이 아니다.
+const HOLDABLE = (p) => ['사용 중', '예정', '홀딩'].includes(p.status) && p.ends_on && salesGroup(p.product_name, p.category) !== 'PT' && !isAddon(p) && p.category !== '월구독' && !/구독/.test(p.product_name || '');
+const mdK = (d) => `${+d.slice(5, 7)}.${+d.slice(8)}`;
+async function holdContext(member_id) {
+  const today = todayKST();
+  const [ps, lk] = await Promise.all([
+    supabase.from('crm_passes').select('id,product_name,category,status,starts_on,ends_on').eq('member_id', member_id),
+    supabase.from('crm_locker_assignments').select('id,locker_no,status,starts_on,ends_on,billing').eq('member_id', member_id).eq('billing', '기간 결제').in('status', ['사용 중', '홀딩']),
+  ]);
+  if (ps.error || lk.error) throw ps.error || lk.error;
+  const passes = ps.data.filter(HOLDABLE), ids = passes.map((p) => p.id);
+  const hs = ids.length ? await supabase.from('crm_holds').select('id,pass_id,starts_on,ends_on,reason,staff_name').in('pass_id', ids) : { data: [] };
+  if (hs.error) throw hs.error;
+  const open = (hs.data || []).filter((h) => !h.ends_on || h.ends_on >= today); // 지금 쉬는 중이거나 앞으로 쉴 예정
+  return { today, passes, lockers: lk.data || [], open };
+}
+async function holdStart({ member_id, starts_on, days, reason, locker, staff }) {
+  if (!member_id) return [400, { error: '필수 정보 누락' }];
+  const n = Math.round(Number(days));
+  if (!(n >= 1 && n <= 180)) return [400, { error: '홀딩 기간은 1일부터 180일까지예요' }];
+  const C = await holdContext(member_id), today = C.today, s0 = starts_on || today;
+  if (!isDate(s0) || s0 < addDaysYMD(today, -7) || s0 > addDaysYMD(today, 60)) return [400, { error: '시작일은 지난 7일부터 앞으로 60일 사이에서 골라주세요' }];
+  if (!C.passes.length) return [400, { error: '홀딩할 기간 이용권이 없어요 (월구독은 홈페이지에서 쉬어가기, PT는 만료가 없어요)' }];
+  if (C.open.length) return [400, { error: '이미 홀딩이 잡혀 있어요. 먼저 풀고 다시 잡아주세요' }];
+  const e0 = addDaysYMD(s0, n - 1), started = s0 <= today, who = staff ? String(staff).slice(0, 20) : null, why = reason ? String(reason).trim().slice(0, 100) : null;
+  for (const p of C.passes) {
+    const ins = await supabase.from('crm_holds').insert({ pass_id: p.id, starts_on: s0, ends_on: e0, reason: why, staff_name: who });
+    if (ins.error) throw ins.error;
+    const up = await supabase.from('crm_passes').update({ ends_on: addDaysYMD(p.ends_on, n), ...(started && p.status === '사용 중' ? { status: '홀딩' } : {}) }).eq('id', p.id);
+    if (up.error) throw up.error;
+  }
+  const withLocker = !!locker && C.lockers.length > 0;
+  if (withLocker) for (const l of C.lockers) { const up = await supabase.from('crm_locker_assignments').update({ ends_on: l.ends_on ? addDaysYMD(l.ends_on, n) : l.ends_on, ...(started ? { status: '홀딩' } : {}) }).eq('id', l.id); if (up.error) throw up.error; }
+  if (started) { const up = await supabase.from('crm_members').update({ holding: true }).eq('id', member_id); if (up.error) throw up.error; }
+  await syncMemberEnd(member_id);
+  await supabase.from('crm_events').insert({ member_id, kind: '홀딩', body: `${mdK(s0)} ~ ${mdK(e0)} (${n}일)${why ? ` · ${why}` : ''}${withLocker ? ' · 락커도 같이' : ''} · 이용권 ${C.passes.length}개를 ${n}일 뒤로`, staff_name: who });
+  clearCache();
+  return member({ id: member_id });
+}
+// 홀딩 풀기: 오늘부터 다시 이용. 안 쓴 날수만큼 끝나는 날을 다시 당긴다 (아직 시작 전이면 전부 취소)
+async function holdEnd({ member_id, staff }) {
+  if (!member_id) return [400, { error: '필수 정보 누락' }];
+  const C = await holdContext(member_id), today = C.today, who = staff ? String(staff).slice(0, 20) : null;
+  const open = C.open.filter((h) => h.ends_on); // 끝나는 날이 없는 옛 홀딩은 날짜를 모르니 상태만 푼다
+  if (!C.open.length && !C.passes.some((p) => p.status === '홀딩')) return [400, { error: '풀 홀딩이 없어요' }];
+  let back = 0;
+  for (const h of open) {
+    const p = C.passes.find((x) => x.id === h.pass_id); if (!p) continue;
+    const from = h.starts_on > today ? h.starts_on : today, unused = Math.max(0, daysBetween(from, h.ends_on) + 1); back = Math.max(back, unused);
+    if (h.starts_on >= today) { const d = await supabase.from('crm_holds').delete().eq('id', h.id); if (d.error) throw d.error; }
+    else { const u = await supabase.from('crm_holds').update({ ends_on: addDaysYMD(today, -1) }).eq('id', h.id); if (u.error) throw u.error; }
+    p.ends_on = addDaysYMD(p.ends_on, -unused);
+  }
+  for (const p of C.passes) { const u = await supabase.from('crm_passes').update({ ends_on: p.ends_on, ...(p.status === '홀딩' ? { status: p.starts_on && p.starts_on > today ? '예정' : '사용 중' } : {}) }).eq('id', p.id); if (u.error) throw u.error; }
+  for (const l of C.lockers.filter((x) => x.status === '홀딩')) { const u = await supabase.from('crm_locker_assignments').update({ status: '사용 중', ends_on: l.ends_on && back ? addDaysYMD(l.ends_on, -back) : l.ends_on }).eq('id', l.id); if (u.error) throw u.error; }
+  const um = await supabase.from('crm_members').update({ holding: false }).eq('id', member_id); if (um.error) throw um.error;
+  await syncMemberEnd(member_id, { allowEarlier: true });
+  await supabase.from('crm_events').insert({ member_id, kind: '홀딩', body: back ? `홀딩 풀기 · 안 쓴 ${back}일은 끝나는 날에서 다시 당겼어요` : '홀딩 풀기', staff_name: who });
+  clearCache();
+  return member({ id: member_id });
+}
+async function passExtend({ pass_id, days, reason, locker, staff }) {
+  const n = Math.round(Number(days));
+  if (!pass_id || !(n >= 1 && n <= 365)) return [400, { error: '연장은 1일부터 365일까지예요' }];
+  const cur = await supabase.from('crm_passes').select('id,member_id,product_name,category,status,ends_on').eq('id', pass_id).maybeSingle();
+  if (cur.error) throw cur.error;
+  const p = cur.data;
+  if (!p || !HOLDABLE(p)) return [400, { error: '연장할 수 있는 기간 이용권이 아니에요' }];
+  const to = addDaysYMD(p.ends_on, n), who = staff ? String(staff).slice(0, 20) : null, why = reason ? String(reason).trim().slice(0, 100) : null;
+  const up = await supabase.from('crm_passes').update({ ends_on: to }).eq('id', p.id); if (up.error) throw up.error;
+  let lockNote = '';
+  if (locker) { const C = await holdContext(p.member_id); for (const l of C.lockers.filter((x) => x.ends_on)) { const u = await supabase.from('crm_locker_assignments').update({ ends_on: addDaysYMD(l.ends_on, n) }).eq('id', l.id); if (u.error) throw u.error; lockNote = ' · 락커도 같이'; } }
+  await syncMemberEnd(p.member_id);
+  await supabase.from('crm_events').insert({ member_id: p.member_id, kind: '기간 연장', body: `${p.product_name} · +${n}일 (${mdK(p.ends_on)} → ${mdK(to)})${why ? ` · ${why}` : ''}${lockNote}`, staff_name: who });
+  clearCache();
+  return member({ id: p.member_id });
+}
+
 // 고객 상태 세 갈래 — 전부 원본(이용권·문의·결제·방문·연락)에서 계산하고 저장하지 않는다
 function status3(m, today, lastContact, visitDays) {
   const expired = m.stage === '만료·이탈';
@@ -2319,6 +2413,7 @@ async function member({ id }) {
   const lc = (lastC.data || [])[0] || null, visitDays = [...new Set(att.data.map((a) => kstDate(a.checked_at)))];
   return [200, {
     status: status3(dm, today, lc, visitDays),
+    hold: await (async () => { const C = await holdContext(id); const h = C.open.filter((x) => x.ends_on).sort((a, b) => a.starts_on.localeCompare(b.starts_on))[0]; return { can: C.passes.length > 0, passes: C.passes.map((p) => ({ id: p.id, product_name: p.product_name, ends_on: p.ends_on, status: p.status })), lockers: C.lockers.map((l) => ({ locker_no: l.locker_no, ends_on: l.ends_on, status: l.status })), now: h ? { starts_on: h.starts_on, ends_on: h.ends_on, reason: h.reason, started: h.starts_on <= today } : null, flag: C.passes.some((p) => p.status === '홀딩') }; })(),
     visits: att.data.map((a) => a.checked_at).sort().reverse(),
     member: { ...dm, photo_url: await photoUrl(photo_path),
       subscription: sb ? { id: sb.id, name: sb.name, plan: sb.plan, addons: sb.addons || [], status: sb.status, next_billing_date: sb.next_billing_date, phone4: digitsOf(sb.phone).slice(-4), linked: safe.subscriber_id === sb.id } : null },
@@ -2671,7 +2766,7 @@ async function tokenOk(tk) {
   return ok;
 }
 
-const ACTIONS = { dashboard, members, member, memberAttendance, renewEngine, renewCheck, todayQueue, contactUpdate, salesDays, lockerBoard, kioskRegister, checkinFind, checkin, photoUpload, staffPunch, staffCall, staffAttendance, staffAttendanceSave,
+const ACTIONS = { dashboard, members, member, memberAttendance, renewEngine, renewCheck, todayQueue, contactUpdate, holdStart, holdEnd, passExtend, salesDays, lockerBoard, kioskRegister, checkinFind, checkin, photoUpload, staffPunch, staffCall, staffAttendance, staffAttendanceSave,
   taskDone, taskUndo, staffList, staffAdd, staffRemove, financeGet, financeSave, salesYear, subSearch, subLink, staffUpdate, rolesSave, report, memoAdd, inquiryAdd, inquiryList, inquiryUpdate, ptBoard, revenue, msgRules, msgRulesSave, ptSession, ptAssign, ptSetLeft, notionSync, passUpdate, paymentMethod, staffOrder, roleColor, taskSnooze, reportV2, attendanceDay, pushKey, pushSubscribe, pushTest, pushWho, products, register, registerUndo, regInquiries, subLocker, reportPush };
 const KIOSK_OK = ['checkinFind', 'checkin', 'photoUpload', 'staffPunch', 'staffCall'];
 const WRITES = ['checkin', 'photoUpload', 'taskDone', 'taskUndo', 'staffAdd', 'staffUpdate', 'staffRemove', 'financeSave', 'subLink', 'rolesSave', 'memoAdd', 'inquiryAdd', 'inquiryUpdate', 'msgRulesSave', 'ptSession', 'ptAssign', 'ptSetLeft', 'notionSync', 'passUpdate', 'paymentMethod', 'staffOrder', 'roleColor', 'taskSnooze', 'pushSubscribe', 'pushTest', 'register', 'registerUndo', 'subLocker', 'reportPush'];
