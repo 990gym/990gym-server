@@ -2038,6 +2038,23 @@ async function members({ q = '', stage = '', limit = 60, offset = 0, sort = '', 
 }
 
 // ---------- 회원 상세 ----------
+// 회원 한 명 출석부: 한 달 치 입실 기록 + 전체 횟수·첫 기록. 달을 안 정하면 마지막으로 온 달
+async function memberAttendance({ id, month }) {
+  if (!id) return [400, { error: '필수 정보 누락' }];
+  const [lastQ, firstQ, cnt] = await Promise.all([
+    supabase.from('crm_attendance').select('checked_at').eq('member_id', id).order('checked_at', { ascending: false }).limit(1),
+    supabase.from('crm_attendance').select('checked_at').eq('member_id', id).order('checked_at', { ascending: true }).limit(1),
+    supabase.from('crm_attendance').select('member_id', { count: 'exact', head: true }).eq('member_id', id),
+  ]);
+  if (lastQ.error || firstQ.error || cnt.error) throw lastQ.error || firstQ.error || cnt.error;
+  const last = lastQ.data[0] ? kstDate(lastQ.data[0].checked_at) : null, first = firstQ.data[0] ? kstDate(firstQ.data[0].checked_at) : null;
+  const ym = /^\d{4}-\d{2}$/.test(String(month || '')) ? month : (last || todayKST()).slice(0, 7);
+  const [y, m] = ym.split('-').map(Number);
+  const from = new Date(Date.UTC(y, m - 1, 1) - 9 * 3600e3).toISOString(), to = new Date(Date.UTC(y, m, 1) - 9 * 3600e3).toISOString();
+  const { data, error } = await supabase.from('crm_attendance').select('checked_at,via').eq('member_id', id).gte('checked_at', from).lt('checked_at', to).order('checked_at', { ascending: false });
+  if (error) throw error;
+  return [200, { month: ym, rows: data.map((r) => ({ at: r.checked_at, via: r.via || null })), total: cnt.count || 0, first, last }];
+}
 async function member({ id }) {
   if (!id) return [400, { error: '필수 정보 누락' }];
   const today = todayKST();
@@ -2410,7 +2427,7 @@ async function tokenOk(tk) {
   return ok;
 }
 
-const ACTIONS = { dashboard, members, member, salesDays, lockerBoard, kioskRegister, checkinFind, checkin, photoUpload, staffPunch, staffCall, staffAttendance, staffAttendanceSave,
+const ACTIONS = { dashboard, members, member, memberAttendance, salesDays, lockerBoard, kioskRegister, checkinFind, checkin, photoUpload, staffPunch, staffCall, staffAttendance, staffAttendanceSave,
   taskDone, taskUndo, staffList, staffAdd, staffRemove, financeGet, financeSave, salesYear, subSearch, subLink, staffUpdate, rolesSave, report, memoAdd, inquiryAdd, inquiryList, inquiryUpdate, ptBoard, revenue, msgRules, msgRulesSave, ptSession, ptAssign, ptSetLeft, notionSync, passUpdate, paymentMethod, staffOrder, roleColor, taskSnooze, reportV2, attendanceDay, pushKey, pushSubscribe, pushTest, pushWho, products, register, registerUndo, regInquiries, subLocker, reportPush };
 const KIOSK_OK = ['checkinFind', 'checkin', 'photoUpload', 'staffPunch', 'staffCall'];
 const WRITES = ['checkin', 'photoUpload', 'taskDone', 'taskUndo', 'staffAdd', 'staffUpdate', 'staffRemove', 'financeSave', 'subLink', 'rolesSave', 'memoAdd', 'inquiryAdd', 'inquiryUpdate', 'msgRulesSave', 'ptSession', 'ptAssign', 'ptSetLeft', 'notionSync', 'passUpdate', 'paymentMethod', 'staffOrder', 'roleColor', 'taskSnooze', 'pushSubscribe', 'pushTest', 'register', 'registerUndo', 'subLocker', 'reportPush'];
