@@ -462,16 +462,27 @@ async function taskDone({ key, staff, note, result, method }) {
   return [200, { success: true }];
 }
 // 연락 뒤 필요할 때만: 결과와 다음 연락일 (둘 다 선택). '안 받음'인데 날짜가 없으면 내일 다시 올린다.
-async function contactUpdate({ key, result, next_on }) {
+async function contactUpdate({ key, result, next_on, staff, note }) {
   if (!TASK_KEY.test(String(key || ''))) return [400, { error: '할 일 정보가 맞지 않아요' }];
   const today = todayKST(), patch = {};
   if (result !== undefined) { if (result && !CONTACT_RESULTS.includes(result)) return [400, { error: '결과를 다시 골라주세요' }]; patch.result = result || null; }
   if (next_on !== undefined) { if (next_on && (!/^\d{4}-\d{2}-\d{2}$/.test(next_on) || next_on <= today || next_on > addDaysYMD(today, 90))) return [400, { error: '다음 연락일은 내일부터 90일 안에서 골라주세요' }]; patch.next_on = next_on || null; }
   if (patch.result === '안 받음' && !next_on) patch.next_on = addDaysYMD(today, 1);
-  if (!Object.keys(patch).length) return [400, { error: '바꿀 내용이 없어요' }];
-  const row = await supabase.from('crm_tasks').select('member_id,done_by').eq('task_key', key).maybeSingle();
+  if (staff !== undefined && staff) { // 누가 했는지 바꾸기 (명단에 있는 이름만)
+    const nm = String(staff).trim(); const ok = await supabase.from('crm_staff').select('id').eq('name', nm).eq('active', true).maybeSingle();
+    if (ok.error) throw ok.error; if (!ok.data) return [400, { error: '직원 명단에 없는 이름이에요' }]; patch.done_by = nm; }
+  const row = await supabase.from('crm_tasks').select('member_id,done_by,result').eq('task_key', key).maybeSingle();
   if (row.error) throw row.error;
   if (!row.data) return [404, { error: '연락 기록을 찾을 수 없어요' }];
+  // 결과(고른 것)와 메모(적은 것)는 한 칸에 '결과 · 메모'로 같이 둔다
+  if (patch.result !== undefined || note !== undefined) {
+    const cur = String(row.data.result || ''), head = cur.split(' · ')[0], hasHead = CONTACT_RESULTS.includes(head);
+    const r1 = patch.result !== undefined ? patch.result : (hasHead ? head : null);
+    const n1 = note !== undefined ? String(note || '').trim().slice(0, 200) : (hasHead ? cur.split(' · ').slice(1).join(' · ') : cur);
+    patch.result = [r1, n1].filter(Boolean).join(' · ') || null;
+  }
+  if (!Object.keys(patch).length) return [400, { error: '바꿀 내용이 없어요' }];
+  if (patch.done_by) row.data.done_by = patch.done_by;
   const up = { data: row.data }, upd = await supabase.from('crm_tasks').update(patch).eq('task_key', key);
   if (upd.error) throw upd.error;
   if (up.data.member_id) { // 이력에는 연락 한 건을 한 줄로: 방금 남긴 줄 뒤에 결과·다음 연락일을 붙인다
@@ -479,7 +490,7 @@ async function contactUpdate({ key, result, next_on }) {
     const tail = [now.data && now.data.result, now.data && now.data.next_on ? `다음 연락 ${+now.data.next_on.slice(5, 7)}.${+now.data.next_on.slice(8)}` : null].filter(Boolean).join(' · ');
     const ev = await supabase.from('crm_events').select('id,body,at').eq('member_id', up.data.member_id).eq('kind', '연락').order('at', { ascending: false }).limit(1);
     const last = (ev.data || [])[0];
-    if (last && last.id != null && kstDate(last.at) === today) await supabase.from('crm_events').update({ body: `${String(last.body).split(' → ')[0]}${tail ? ` → ${tail}` : ''}` }).eq('id', last.id);
+    if (last && last.id != null && kstDate(last.at) === today) await supabase.from('crm_events').update({ body: `${String(last.body).split(' → ')[0]}${tail ? ` → ${tail}` : ''}`, staff_name: up.data.done_by }).eq('id', last.id);
     else if (tail) await supabase.from('crm_events').insert({ member_id: up.data.member_id, kind: '연락', body: tail, staff_name: up.data.done_by });
   }
   return [200, { success: true, ...patch }];
@@ -1033,13 +1044,42 @@ async function renewEngine({ refresh } = {}) {
   }];
 }
 
+// ---------- 상황별 문자 문구 (직원이 자기 폰으로 보내는 문자의 기본 문구, 설정에서 고칠 수 있다) ----------
+const SMS_DEFAULT = [
+  { key: 'rv0', title: '재등록 대상 · 두 달 동안 안 오신 분', body: '{이름}님, 990짐이에요. 요즘 통 못 뵌 것 같아 안부 여쭤요. 이번 주에 편한 날 한 번 오시면 가볍게 루틴 다시 잡아 드릴게요.' },
+  { key: 'rv_low', title: '재등록 대상 · 가끔 오시는 분', body: '{이름}님, 990짐이에요. 요즘 운동은 어떠세요? 이번 주에 편한 시간 알려 주시면 루틴 같이 봐 드릴게요.' },
+  { key: 'rv_ok', title: '재등록 대상 · 꾸준히 오시는 분', body: '{이름}님, 990짐이에요. 이용권이 {끝나는날}에 끝나요. 꾸준히 오시는 만큼 이어 가시기 좋게 안내해 드릴게요. 오실 때 인포에 말씀해 주세요.' },
+  { key: 'exp', title: '회원권 만료 예정', body: '{이름}님, 990짐이에요. 회원권이 곧 끝나요. 연장은 인포에서 바로 도와드릴게요.' },
+  { key: 'cancel', title: '월구독 해지 신청', body: "{이름}님, 990짐이에요. 구독 해지 신청 확인했어요. 잠깐 쉬고 싶으실 때는 해지 대신 '쉬어가기'도 있어요. 필요하시면 말씀해 주세요." },
+  { key: 'pay', title: '월구독 결제 실패', body: '{이름}님, 990짐이에요. 이번 달 구독 결제가 카드 문제로 안 됐어요. 홈페이지에서 카드만 바꿔 주시면 바로 이어져요.' },
+  { key: 'abs', title: '미출석 안부', body: '{이름}님, 990짐이에요. 한동안 못 뵈어서 안부 여쭤요. 다시 오실 때 부담 없게 가벼운 루틴으로 도와드릴게요.' },
+  { key: 'new', title: '신규 · 첫 방문 전', body: '{이름}님, 990짐이에요. 등록하시고 아직 못 뵌 것 같아요. 첫 방문 때 기구 사용법부터 같이 봐 드릴게요. 편한 날 알려 주세요.' },
+  { key: 'lapse', title: '만료 후 복귀', body: '{이름}님, 990짐이에요. 그동안 함께해 주셔서 감사했어요. 다시 운동 생각나실 때 편하게 연락 주세요.' },
+  { key: 'inq', title: '문의 리턴', body: '{이름}님, 990짐이에요. 지난번 문의 주셔서 감사해요. 궁금한 점 있으시면 편하게 물어봐 주세요.' },
+  { key: 'lock', title: '락커 기간 만료', body: '{이름}님, 990짐이에요. 락커 이용 기간이 끝났어요. 연장하시거나 짐을 비워 주시면 감사하겠어요.' },
+];
+async function smsMap() {
+  const st = await supabase.from('crm_settings').select('value').eq('key', 'sms_templates').maybeSingle();
+  const v = (st.data && st.data.value) || {};
+  return SMS_DEFAULT.map((t) => ({ ...t, body: typeof v[t.key] === 'string' && v[t.key].trim() ? v[t.key] : t.body, edited: typeof v[t.key] === 'string' && v[t.key].trim() !== '' && v[t.key] !== t.body }));
+}
+async function smsTemplates() { return [200, { templates: await smsMap(), vars: ['{이름}', '{끝나는날}'] }]; }
+async function smsTemplatesSave({ templates }) {
+  const v = {};
+  (Array.isArray(templates) ? templates : []).forEach((t) => { const d = SMS_DEFAULT.find((x) => x.key === t.key); if (d && typeof t.body === 'string' && t.body.trim() && t.body.trim() !== d.body) v[t.key] = t.body.trim().slice(0, 300); });
+  const { error } = await supabase.from('crm_settings').upsert({ key: 'sms_templates', value: v, updated_at: new Date().toISOString() }, { onConflict: 'key' });
+  if (error) throw error;
+  return smsTemplates();
+}
+const smsKeyOf = (key, tag) => { const k = String(key).split(':')[0]; return k === 'exp' ? (/해지/.test(tag || '') ? 'cancel' : 'exp') : k === 'pay' ? 'pay' : /^abs/.test(k) ? 'abs' : k === 'nov' || k === 'new' ? 'new' : k === 'lapse' ? 'lapse' : k === 'inq' ? 'inq' : /^lock/.test(k) ? 'lock' : 'rv_low'; };
+
 // ---------- 오늘: 할 일은 한 줄 (제1원리) ----------
 // 원자 5개(고객·이용권·방문·결제·연락)에서 나온 '지금 해야 할 연락'만 남긴다.
 // 순서 = 언제까지(지금 → 오늘 → 이번 주) → 지켜야 할 매출이 큰 순. 센터에 계신 분은 항상 맨 위.
 const DUE = { now: 0, today: 1, week: 2 };
 const DUE_OF = { '지금 바로': 'now', '오늘 안에': 'today', '이번 주 안에': 'week' };
 async function todayQueue() {
-  const [[, d], [, e]] = await Promise.all([dashboard(), renewEngine()]);
+  const [[, d], [, e], smsList] = await Promise.all([dashboard(), renewEngine(), smsMap()]);
   const today = e.today, items = [];
   const rv = new Set(e.rows.map((r) => r.member_id));
   let waiting = 0;
@@ -1059,7 +1099,7 @@ async function todayQueue() {
     items.push({ key: doneToday ? c.key : `rv:${r.member_id}:${today}`, kind: 'renew', member_id: r.member_id, name: r.name, phone: r.phone, in_gym: r.in_gym,
       d_left: r.d_left, v60: r.v60, verb: r.in_gym ? 'meet' : r.v60 === 0 ? 'call' : r.v60 <= 4 ? 'text' : 'meet',
       tag: again ? '다시 연락하는 날' : r.d_left === 0 ? '오늘 끝나요' : `D-${r.d_left}`, why: `${r.product} · ${how}`, action: act, stake: r.risk, stake_est: r.est,
-      basis: { of10: Math.round(r.p / 10), n: r.basis_n }, due,
+      basis: { of10: Math.round(r.p / 10), n: r.basis_n }, due, sms: r.v60 === 0 ? 'rv0' : r.v60 <= 4 ? 'rv_low' : 'rv_ok', ends_on: r.ends_on,
       done: doneToday, done_by: doneToday ? c.by : null, done_at: doneToday ? c.at : null, result: doneToday ? c.result : null, next_on: doneToday ? c.next_on : null });
   });
   (d.tasks || []).forEach((t) => {
@@ -1067,7 +1107,7 @@ async function todayQueue() {
     if (t.member_id && rv.has(t.member_id) && /^(exp|abs14|abs30|nov|new):/.test(t.key)) return; // 재등록 줄에서 이미 챙김
     items.push({ key: t.key, kind: t.kind, member_id: t.member_id, inquiry_id: t.inquiry_id || null, name: t.name, phone: t.phone, in_gym: t.in_gym,
       verb: t.in_gym ? 'meet' : /문자/.test(t.action) ? 'text' : 'call',
-      tag: t.tag, why: [t.title, ...(t.sub || []).slice(0, 1)].join(' · '), action: t.action, stake: null, due: t.in_gym ? 'now' : DUE_OF[t.group] || 'week',
+      sms: smsKeyOf(t.key, t.tag), tag: t.tag, why: [t.title, ...(t.sub || []).slice(0, 1)].join(' · '), action: t.action, stake: null, due: t.in_gym ? 'now' : DUE_OF[t.group] || 'week',
       done: !!t.done, done_by: t.done_by || null, done_at: t.done_at || null, result: t.done ? t.result || null : null });
   });
   items.sort((a, b) => (a.done - b.done) || (!!b.in_gym - !!a.in_gym) || DUE[a.due] - DUE[b.due] || (b.stake || 0) - (a.stake || 0) || String(a.name).localeCompare(String(b.name)));
@@ -1077,7 +1117,7 @@ async function todayQueue() {
     stake: { total: e.totals.risk, members: e.totals.members, est: e.totals.est },
     counts: { open: open.length, done: items.length - open.length, now: open.filter((x) => x.due === 'now').length, waiting, scheduled },
     outcome: e.outcomes, model: e.model.tables[14].map((b) => ({ band: b.band, of10: Math.round(b.p * 10), n: b.n })), model_total: e.model.total,
-    staff: d.staff, workMissing: d.workMissing,
+    staff: d.staff, workMissing: d.workMissing, sms: Object.fromEntries(smsList.map((t) => [t.key, t.body])),
     map: e.rows.map((r) => ({ member_id: r.member_id, name: r.name, d_left: r.d_left, v60: r.v60, value: r.value, risk: r.risk, p: r.p })),
   }];
 }
@@ -2766,7 +2806,7 @@ async function tokenOk(tk) {
   return ok;
 }
 
-const ACTIONS = { dashboard, members, member, memberAttendance, renewEngine, renewCheck, todayQueue, contactUpdate, holdStart, holdEnd, passExtend, salesDays, lockerBoard, kioskRegister, checkinFind, checkin, photoUpload, staffPunch, staffCall, staffAttendance, staffAttendanceSave,
+const ACTIONS = { dashboard, members, member, memberAttendance, renewEngine, renewCheck, todayQueue, contactUpdate, holdStart, holdEnd, passExtend, smsTemplates, smsTemplatesSave, salesDays, lockerBoard, kioskRegister, checkinFind, checkin, photoUpload, staffPunch, staffCall, staffAttendance, staffAttendanceSave,
   taskDone, taskUndo, staffList, staffAdd, staffRemove, financeGet, financeSave, salesYear, subSearch, subLink, staffUpdate, rolesSave, report, memoAdd, inquiryAdd, inquiryList, inquiryUpdate, ptBoard, revenue, msgRules, msgRulesSave, ptSession, ptAssign, ptSetLeft, notionSync, passUpdate, paymentMethod, staffOrder, roleColor, taskSnooze, reportV2, attendanceDay, pushKey, pushSubscribe, pushTest, pushWho, products, register, registerUndo, regInquiries, subLocker, reportPush };
 const KIOSK_OK = ['checkinFind', 'checkin', 'photoUpload', 'staffPunch', 'staffCall'];
 const WRITES = ['checkin', 'photoUpload', 'taskDone', 'taskUndo', 'staffAdd', 'staffUpdate', 'staffRemove', 'financeSave', 'subLink', 'rolesSave', 'memoAdd', 'inquiryAdd', 'inquiryUpdate', 'msgRulesSave', 'ptSession', 'ptAssign', 'ptSetLeft', 'notionSync', 'passUpdate', 'paymentMethod', 'staffOrder', 'roleColor', 'taskSnooze', 'pushSubscribe', 'pushTest', 'register', 'registerUndo', 'subLocker', 'reportPush'];
