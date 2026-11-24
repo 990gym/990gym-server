@@ -2213,7 +2213,10 @@ async function checkin({ id }) {
   const main = passes.data.filter((p) => !pt.includes(p)).sort((a, b) => String(b.ends_on).localeCompare(String(a.ends_on)))[0];
   const out = { ...base, again, days_left: d.days_left, ends_on: d.ends_on, sub: d.sub, next_billing: d.next_billing, product: main ? main.product_name : null,
     pt_left: pt.reduce((a, p) => a + (p.remaining_count || 0), 0), pt_total: pt.reduce((a, p) => a + (p.total_count || 0), 0),
-    this_month: thisMonth, first_time: !m.last_attended_on, dup, today_n: todayN + (dup ? 0 : 1) };
+    this_month: thisMonth, first_time: !m.last_attended_on, dup, today_n: todayN + (dup ? 0 : 1),
+    // 태블릿 인사말용: 지난 운동 뒤 며칠 만인지, 오늘이 몇 번째 운동인지
+    gap_days: m.last_attended_on && m.last_attended_on < today ? daysBetween(m.last_attended_on, today) : null,
+    visits: (m.total_visits || 0) + (again || dup ? 0 : 1) };
   if (!dup) await pushSend(checkinMessage(m.name, out)); // 직원 폰으로 (10분 안에 또 찍은 건 안 보냄)
   return [200, out];
 }
