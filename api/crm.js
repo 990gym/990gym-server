@@ -646,7 +646,7 @@ async function revenue({ period = 'month' }) {
 
 // ---------- 날짜별 등록 내역 (최신 날짜부터, 하루 단위로 끊어서 '더 보기') ----------
 // before: 이 날짜 '전'까지 (YYYY-MM-DD, 없으면 오늘까지) · date: 이 날짜부터 거꾸로 · filter: all | 신규 | 재등록 | 복귀 | 환불 | nosub(월구독 자동결제 빼기)
-async function salesDays({ before = '', date = '', filter = 'all' } = {}) {
+async function salesDays({ before = '', date = '', filter = 'all', maxDays = 0 } = {}) {
   const today = todayKST(), YMD = /^\d{4}-\d{2}-\d{2}$/;
   const end = YMD.test(date) ? addDaysYMD(date, 1) : YMD.test(before) ? before : addDaysYMD(today, 1); // 이 날 0시 전까지
   const LIMIT = 150;
@@ -673,16 +673,20 @@ async function salesDays({ before = '', date = '', filter = 'all' } = {}) {
   rows.forEach((x) => {
     const d = dayOf(x.paid_at), ps = pm[x.pass_id] || {};
     const product = ps.product_name || x.item || '-';
-    const auto = /^토스 자동결제/.test(x.method_note || '');
+    const group = salesGroup(product, ps.category);
+    const auto = /^토스 자동결제/.test(x.method_note || '') || group === '월구독'; // 월구독은 모두 자동결제
     if (!byDay[d]) { byDay[d] = { day: d, total: 0, count: 0, items: [] }; days.push(byDay[d]); }
     byDay[d].total += x.amount; byDay[d].count++;
-    const group = salesGroup(product, ps.category);
     // PT 3회 9.9만 = 체험 PT
     const trial = group === 'PT' && (x.amount === 99000 || /체험/.test(product));
     byDay[d].items.push({ id: x.id, name: x.member_id ? nm[x.member_id] || '-' : '비회원', member_id: x.member_id || null, kind: x.kind, product, trial,
       group, amount: x.amount, method: x.method || null, split: x.method_split || null, note: auto ? null : (x.method_note || null), auto });
   });
-  return [200, { today, days, next }];
+  let outDays = days;
+  if (filter === 'nosub') outDays = days.map((d) => { const it = d.items.filter((x) => !x.auto); return { ...d, items: it, count: it.length, total: it.reduce((a, x) => a + x.amount, 0) }; }).filter((d) => d.items.length);
+  const n = Math.max(0, Math.min(60, Number(maxDays) || 0));
+  if (n && outDays.length > n) { outDays = outDays.slice(0, n); next = outDays[n - 1].day; } // 이 날 '전'부터 다음 쪽
+  return [200, { today, days: outDays, next }];
 }
 
 // ---------- 보고서 v2 (월 + 주차, 크마스터처럼 보기 쉽게) ----------
