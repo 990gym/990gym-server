@@ -121,7 +121,7 @@ const trialOnlySet = () => memo('trial_set', 300000, async () => {
 });
 function markTrial(list, set) { list.forEach((m) => { if (m.stage !== '만료·이탈' && set.has(m.id)) m.stage = '체험'; }); return list; }
 function decorate(m0, today, subs) {
-  const ss = subState(subOf(m0, subs), today, m0, subs);
+  const sb = subOf(m0, subs), ss = subState(sb, today, m0, subs);
   // 해지 신청·결제 실패한 구독은 결제된 날까지 쓴다 (그 날이 이미 지났으면 브로제이 기간을 본다)
   const m = ss && ss.end && ss.end >= today ? { ...m0, ends_on: ss.end } : m0;
   const live = ss && (ss.kind === '구독 중' || ss.kind === '쉬어가기');
@@ -131,6 +131,8 @@ function decorate(m0, today, subs) {
     holding: m.holding || (ss && ss.kind === '쉬어가기') || false,
     stage,
     sub: ss ? ss.kind : null, next_billing: live ? ss.next : null, sub_linked: ss ? !ss.unlinked : false,
+    // 월구독 이름은 구독 서버의 플랜으로 보여 준다 (다른 작업에서 넣은 변경을 그대로 유지)
+    sub_plan: ss && !ss.unlinked && sb && sb.plan ? sb.plan : null, sub_end: (ss && !live && ss.end) || null,
     days_left: live ? null : m.ends_on ? daysBetween(today, m.ends_on) : null,
     days_absent: m.last_attended_on ? daysBetween(m.last_attended_on, today) : null,
   };
@@ -284,7 +286,7 @@ async function dashboardRaw() {
     getFinance(),
     supabase.from('crm_staff').select('id,name,role').eq('active', true).order('created_at'),
     subsMap(),
-    selectAll(() => supabase.from('crm_tasks').select('task_key,done_by,done_at,kind,due_on,result').gte('done_at', new Date(Date.parse(monthStartISO) - 7 * DAY).toISOString())),
+    selectAll(() => supabase.from('crm_tasks').select('task_key,done_by,done_at,kind,due_on,result,next_on').gte('done_at', new Date(Date.parse(monthStartISO) - 7 * DAY).toISOString())),
     staffMeta(), getRoles(), trialOnlySet(),
   ]);
   for (const r of [lockers, inq, totalCount, snap, staff]) if (r.error) throw r.error;
@@ -380,8 +382,10 @@ async function dashboardRaw() {
   // '안 받음'으로 미룬 일: due_on 전까지 숨기고, 그날 다시 올라온다
   const snz = Object.fromEntries(doneRows.filter((r) => r.task_key.startsWith('snz:') && r.due_on && r.due_on > today).map((r) => [r.task_key.slice(4), r]));
   const doneToday = doneRows.filter((r) => kstDate(r.done_at) === today);
-  const list = tasks.filter((t) => !done[t.key] || kstDate(done[t.key].done_at) === today)
-    .map((t) => (done[t.key] ? { ...t, done: true, done_by: done[t.key].done_by, done_at: done[t.key].done_at, result: done[t.key].result } : snz[t.key] ? { ...t, snoozed: snz[t.key].due_on, snoozed_by: snz[t.key].done_by } : t));
+  // 다음 연락일을 정해 둔 일은 그날 다시 올라온다 (그 전까지는 숨김)
+  const again = (r) => r && r.next_on && r.next_on <= today && kstDate(r.done_at) < today;
+  const list = tasks.filter((t) => !done[t.key] || kstDate(done[t.key].done_at) === today || again(done[t.key]))
+    .map((t) => (again(done[t.key]) ? { ...t, tag: '다시 연락하는 날', group: '오늘 안에' } : done[t.key] ? { ...t, done: true, done_by: done[t.key].done_by, done_at: done[t.key].done_at, result: done[t.key].result } : snz[t.key] ? { ...t, snoozed: snz[t.key].due_on, snoozed_by: snz[t.key].done_by } : t));
   const staffStats = {};
   (staff.data || []).forEach((s) => { staffStats[s.name] = { today: 0, month: 0 }; });
   doneRows.filter((r) => r.done_at >= monthStartISO).forEach((r) => { const s = (staffStats[r.done_by] = staffStats[r.done_by] || { today: 0, month: 0 }); s.month++; if (kstDate(r.done_at) === today) s.today++; });
@@ -401,6 +405,8 @@ async function dashboardRaw() {
     snapshotAt: snap.data[0] ? snap.data[0].created_at : null, lastPayDay: lastPay || null,
     totals: {
       members: totalCount.count, active: active.length, holding: active.filter((m) => m.holding).length,
+      // 정착: 처음 시작한 지 1~2달 된 분 중 지금도 오시는 분 (최근 2주 안에 방문)
+      settle: (() => { const g = all.filter((m) => m.first_started_on && m.first_started_on >= addDaysYMD(today, -60) && m.first_started_on <= addDaysYMD(today, -29)); return { n: g.length, kept: g.filter((m) => m.stage !== '만료·이탈' && m.days_absent != null && m.days_absent < 14).length }; })(),
       inquiries30: inq.data.filter((q) => !q.result || q.result === '상담 중').length, lapsedThisMonth: thisMonthLapsed,
       lockers: lockerTotal(lockers.data), lockersUsed: new Set(assigns.map((a) => a.locker_no)).size,
       lockerSoon: assigns.filter((a) => a.ends_on && daysBetween(today, a.ends_on) >= 0 && daysBetween(today, a.ends_on) <= 7).length,
@@ -418,9 +424,9 @@ async function dashboardRaw() {
 }
 
 // ---------- 할 일 완료 ----------
-const TASK_KEY = /^(exp|pay|abs14|abs30|nov|new|lapse|inq|lockx):[0-9a-f-]{36}:[0-9-]{0,10}$/;
+const TASK_KEY = /^(exp|pay|abs14|abs30|nov|new|lapse|inq|lockx|rv):[0-9a-f-]{36}:[0-9-]{0,10}$/;
 const TASK_RESULTS = ['연락 완료', '문자 보냄', '직접 만남', '재등록 의사 있음', '거절', '안 받음'];
-const TASK_LABEL = { exp: '재등록 안내', pay: '결제 실패 안내', abs14: '미출석 안부', abs30: '장기 미출석 연락', nov: '첫 방문 연락', new: '신규 안부', lapse: '복귀 안내', inq: '리턴 연락', lockx: '락커 정리' };
+const TASK_LABEL = { exp: '재등록 안내', pay: '결제 실패 안내', abs14: '미출석 안부', abs30: '장기 미출석 연락', nov: '첫 방문 연락', new: '신규 안부', lapse: '복귀 안내', inq: '리턴 연락', lockx: '락커 정리', rv: '방문 약속 연락' };
 async function taskSnooze({ key, staff, days = 1 }) {
   if (!TASK_KEY.test(String(key || ''))) return [400, { error: '할 일 정보가 맞지 않아요' }];
   const name = String(staff || '').trim();
@@ -434,7 +440,10 @@ async function taskSnooze({ key, staff, days = 1 }) {
   if (!isInq) await supabase.from('crm_events').insert({ member_id: refId, kind: '할 일', body: `${TASK_LABEL[kind]} · 안 받음 → ${+until.slice(5, 7)}.${+until.slice(8)} 다시 연락`, staff_name: name });
   return [200, { success: true, until }];
 }
-async function taskDone({ key, staff, note, result }) {
+const CONTACT_METHODS = ['전화', '문자', '인사'];
+const CONTACT_RESULTS = ['통화함', '안 받음', '재등록 의사', '거절'];
+async function taskDone({ key, staff, note, result, method }) {
+  method = CONTACT_METHODS.includes(method) ? method : null;
   if (result && TASK_RESULTS.includes(result)) note = `${result}${note ? ` · ${note}` : ''}`;
   if (!TASK_KEY.test(String(key || ''))) return [400, { error: '할 일 정보가 맞지 않아요' }];
   const name = String(staff || '').trim();
@@ -445,12 +454,35 @@ async function taskDone({ key, staff, note, result }) {
   const [kind, refId] = key.split(':');
   const isInq = kind === 'inq';
   const member_id = isInq ? null : refId;
-  const ins = await supabase.from('crm_tasks').upsert({ task_key: key, member_id, inquiry_id: isInq ? refId : null, kind, due_on: todayKST(), done_at: new Date().toISOString(), done_by: name, result: note ? String(note).slice(0, 300) : null }, { onConflict: 'task_key' });
+  const ins = await supabase.from('crm_tasks').upsert({ task_key: key, member_id, inquiry_id: isInq ? refId : null, kind, due_on: todayKST(), done_at: new Date().toISOString(), done_by: name, result: note ? String(note).slice(0, 300) : null, method, next_on: null }, { onConflict: 'task_key' });
   if (ins.error) throw ins.error;
   if (isInq) return [200, { success: true }];
   if (kind === 'lockx') await supabase.from('crm_locker_assignments').update({ lock_code_changed_at: new Date().toISOString() }).eq('member_id', member_id).eq('ends_on', key.split(':')[2]).eq('billing', '기간 결제');
-  await supabase.from('crm_events').insert({ member_id, kind: '할 일', body: `${TASK_LABEL[kind]} 완료${note ? ` · ${String(note).slice(0, 300)}` : ''}`, staff_name: name });
+  await supabase.from('crm_events').insert({ member_id, kind: method ? '연락' : '할 일', body: `${method ? `${method} · ` : ''}${TASK_LABEL[kind]}${note ? ` · ${String(note).slice(0, 300)}` : ''}`, staff_name: name });
   return [200, { success: true }];
+}
+// 연락 뒤 필요할 때만: 결과와 다음 연락일 (둘 다 선택). '안 받음'인데 날짜가 없으면 내일 다시 올린다.
+async function contactUpdate({ key, result, next_on }) {
+  if (!TASK_KEY.test(String(key || ''))) return [400, { error: '할 일 정보가 맞지 않아요' }];
+  const today = todayKST(), patch = {};
+  if (result !== undefined) { if (result && !CONTACT_RESULTS.includes(result)) return [400, { error: '결과를 다시 골라주세요' }]; patch.result = result || null; }
+  if (next_on !== undefined) { if (next_on && (!/^\d{4}-\d{2}-\d{2}$/.test(next_on) || next_on <= today || next_on > addDaysYMD(today, 90))) return [400, { error: '다음 연락일은 내일부터 90일 안에서 골라주세요' }]; patch.next_on = next_on || null; }
+  if (patch.result === '안 받음' && !next_on) patch.next_on = addDaysYMD(today, 1);
+  if (!Object.keys(patch).length) return [400, { error: '바꿀 내용이 없어요' }];
+  const row = await supabase.from('crm_tasks').select('member_id,done_by').eq('task_key', key).maybeSingle();
+  if (row.error) throw row.error;
+  if (!row.data) return [404, { error: '연락 기록을 찾을 수 없어요' }];
+  const up = { data: row.data }, upd = await supabase.from('crm_tasks').update(patch).eq('task_key', key);
+  if (upd.error) throw upd.error;
+  if (up.data.member_id) { // 이력에는 연락 한 건을 한 줄로: 방금 남긴 줄 뒤에 결과·다음 연락일을 붙인다
+    const now = await supabase.from('crm_tasks').select('result,next_on').eq('task_key', key).maybeSingle();
+    const tail = [now.data && now.data.result, now.data && now.data.next_on ? `다음 연락 ${+now.data.next_on.slice(5, 7)}.${+now.data.next_on.slice(8)}` : null].filter(Boolean).join(' · ');
+    const ev = await supabase.from('crm_events').select('id,body,at').eq('member_id', up.data.member_id).eq('kind', '연락').order('at', { ascending: false }).limit(1);
+    const last = (ev.data || [])[0];
+    if (last && last.id != null && kstDate(last.at) === today) await supabase.from('crm_events').update({ body: `${String(last.body).split(' → ')[0]}${tail ? ` → ${tail}` : ''}` }).eq('id', last.id);
+    else if (tail) await supabase.from('crm_events').insert({ member_id: up.data.member_id, kind: '연락', body: tail, staff_name: up.data.done_by });
+  }
+  return [200, { success: true, ...patch }];
 }
 async function taskUndo({ key }) {
   if (!TASK_KEY.test(String(key || ''))) return [400, { error: '할 일 정보가 맞지 않아요' }];
@@ -863,6 +895,180 @@ async function attendanceDay({ date }) {
   list.forEach((x, i) => { x.no = i + 1; x.in_gym = d === today && nowMs - Date.parse(x.last_at) < 2 * 3600e3; });
   const hours = Array(24).fill(0); rows.forEach((r) => hours[kstHour(r.checked_at)]++);
   return [200, { date: d, today, total: rows.length, people: list.length, now: list.filter((x) => x.in_gym).length, hours, list }];
+}
+
+// ---------- 재등록 엔진 (제1원리: 방문이 재등록을 만든다) ----------
+// 원자 5개(사람·약속·방문·돈·연락)로만 계산한다.
+// 1) 확률: 지난 기간권이 끝나기 전 60일 방문 횟수 구간별 실제 재등록 비율 (하루 한 번 다시 계산해 저장)
+// 2) 위험 금액 = 이용권 값 × (1 - 확률)  3) 할 일 = 방문을 만드는 연락  4) 결과 = 연락 뒤 7일 안에 왔는지
+const RENEW_BANDS = [{ k: '0회', lo: 0, hi: 0 }, { k: '1~4회', lo: 1, hi: 4 }, { k: '5~12회', lo: 5, hi: 12 }, { k: '13회 이상', lo: 13, hi: 1e9 }];
+const bandOf = (v) => RENEW_BANDS.find((b) => v >= b.lo && v <= b.hi).k;
+const isPeriodPass = (p) => ['헬스 기간권', 'GX', '이전 상품'].includes(p.category) && !/(체험|PT|락커|운동복|일일|수건|양도)/.test(p.product_name || '');
+const dayKST = (iso) => new Date(Date.parse(iso) + 9 * 3600e3).toISOString().slice(0, 10);
+async function attendanceDays(fromISO) {
+  const rows = await selectAll(() => supabase.from('crm_attendance').select('member_id,checked_at').gte('checked_at', fromISO));
+  const by = {}; rows.forEach((r) => { (by[r.member_id] = by[r.member_id] || new Set()).add(dayKST(r.checked_at)); });
+  return by;
+}
+const countIn = (set, from, to) => { if (!set) return 0; let n = 0; set.forEach((d) => { if (d >= from && d <= to) n++; }); return n; };
+// 지난 기간권 하나하나: 끝나기 k일 전 시점에서 본 '두 달 방문 횟수'와 실제 재등록 여부 (원본에서 언제든 다시 계산)
+const RENEW_K = [0, 14, 30];
+const horizonOf = (dLeft) => (dLeft < 14 ? 0 : dLeft < 30 ? 14 : 30);
+async function renewHistory() {
+  const first = await supabase.from('crm_attendance').select('checked_at').order('checked_at', { ascending: true }).limit(1);
+  const today = todayKST(), firstDay = first.data && first.data[0] ? dayKST(first.data[0].checked_at) : addDaysYMD(today, -300);
+  // 기간: 방문 기록이 90일 이상 쌓인 뒤 끝난 것 ~ 60일 전에 끝난 것 (재등록했는지 볼 시간이 지난 것만)
+  const from = [addDaysYMD(today, -330), addDaysYMD(firstDay, 92)].sort().pop(), to = addDaysYMD(today, -60);
+  const [passes, att] = await Promise.all([allPassesCached(), attendanceDays(new Date(Date.parse(`${addDaysYMD(from, -92)}T00:00:00+09:00`)).toISOString())]);
+  const byMember = {}; passes.forEach((p) => { (byMember[p.member_id] = byMember[p.member_id] || []).push(p); });
+  const rows = [];
+  Object.values(byMember).forEach((list) => {
+    const ended = list.filter((p) => isPeriodPass(p) && p.ends_on && p.ends_on >= from && p.ends_on <= to && !['무효', '환불'].includes(p.status)).sort((a, b) => b.ends_on.localeCompare(a.ends_on))[0];
+    if (!ended) return;
+    const e = ended.ends_on, lo = addDaysYMD(e, -45), hi = addDaysYMD(e, 60);
+    const nx = list.find((q) => q.id !== ended.id && !/(체험|락커|운동복|일일|수건|양도)/.test(q.product_name || '') && q.ends_on && q.ends_on > e && (q.starts_on || q.registered_on || '') >= lo && (q.registered_on || q.starts_on || '') <= hi);
+    const v = {}; RENEW_K.forEach((k) => { v[k] = countIn(att[ended.member_id], addDaysYMD(e, -k - 60), addDaysYMD(e, -k)); });
+    rows.push({ ends_on: e, v, renewed: !!nx, next_price: nx ? Number(nx.price_paid) || 0 : 0 });
+  });
+  return { from, to, rows };
+}
+function renewTable(rows, k) {
+  const st = Object.fromEntries(RENEW_BANDS.map((b) => [b.k, { n: 0, renewed: 0 }]));
+  rows.forEach((r) => { const b = bandOf(r.v[k]); st[b].n++; if (r.renewed) st[b].renewed++; });
+  const total = rows.length, totalR = rows.filter((r) => r.renewed).length;
+  return RENEW_BANDS.map((b) => ({ band: b.k, n: st[b.k].n, renewed: st[b.k].renewed, p: st[b.k].n >= 10 ? st[b.k].renewed / st[b.k].n : (total ? totalR / total : 0) }));
+}
+async function renewModel(force) {
+  const st = await supabase.from('crm_settings').select('value').eq('key', 'renew_model').maybeSingle();
+  const v = st.data && st.data.value;
+  if (!force && v && v.tables && Date.now() - Date.parse(v.at) < DAY) return v;
+  const { from, to, rows } = await renewHistory();
+  const tables = {}; RENEW_K.forEach((k) => { tables[k] = renewTable(rows, k); });
+  const prices = rows.map((r) => r.next_price).filter((x) => x > 0).sort((x, y) => x - y);
+  const out = { at: new Date().toISOString(), from, to, total: rows.length, tables, bands: tables[0], renew_value: prices.length ? prices[Math.floor(prices.length / 2)] : 0 };
+  await supabase.from('crm_settings').upsert({ key: 'renew_model', value: out, updated_at: out.at }, { onConflict: 'key' });
+  return out;
+}
+// 예측 검증: 그 달보다 '앞서' 끝난 이용권만으로 비율을 만들고, 그 달에 끝난 이용권의 실제 재등록과 비교한다 (끝나기 2주 전 시점 기준)
+async function renewCheck() {
+  const { from, to, rows } = await renewHistory();
+  const K = 14, months = [...new Set(rows.map((r) => r.ends_on.slice(0, 7)))].sort();
+  const out = [], cal = Object.fromEntries(RENEW_BANDS.map((b) => [b.k, { n: 0, expected: 0, actual: 0 }]));
+  months.forEach((ym) => {
+    const prior = rows.filter((r) => r.ends_on < `${ym}-01`), cur = rows.filter((r) => r.ends_on.slice(0, 7) === ym);
+    if (prior.length < 60 || !cur.length) return; // 배울 기록이 너무 적은 달은 건너뛴다
+    const P = Object.fromEntries(renewTable(prior, K).map((b) => [b.band, b.p]));
+    let exp = 0, act = 0;
+    cur.forEach((r) => { const b = bandOf(r.v[K]); exp += P[b]; act += r.renewed ? 1 : 0; cal[b].n++; cal[b].expected += P[b]; cal[b].actual += r.renewed ? 1 : 0; });
+    out.push({ ym, n: cur.length, learned: prior.length, expected: Math.round(exp * 10) / 10, actual: act });
+  });
+  const tot = out.reduce((a, m) => ({ n: a.n + m.n, expected: a.expected + m.expected, actual: a.actual + m.actual }), { n: 0, expected: 0, actual: 0 });
+  const model = await renewModel();
+  return [200, { from, to, total: rows.length, months: out, totals: { ...tot, expected: Math.round(tot.expected) },
+    bands: RENEW_BANDS.map((b) => ({ band: b.k, n: cal[b.k].n, expected: cal[b.k].n ? Math.round(cal[b.k].expected / cal[b.k].n * 100) : null, actual: cal[b.k].n ? Math.round(cal[b.k].actual / cal[b.k].n * 100) : null })),
+    tables: RENEW_K.map((k) => ({ k, bands: model.tables[k].map((b) => ({ band: b.band, n: b.n, p: Math.round(b.p * 100) })) })),
+    contacts: (await renewEngine())[1].outcomes }];
+}
+async function renewEngine({ refresh } = {}) {
+  const today = todayKST(), horizon = addDaysYMD(today, 60);
+  const [model, passes, att, members, tasks, recentAtt, pays] = await Promise.all([
+    renewModel(!!refresh), allPassesCached(),
+    attendanceDays(new Date(Date.now() - 100 * DAY).toISOString()),
+    selectAll(() => supabase.from('crm_members').select(MEMBER_COLS).neq('stage', '만료·이탈')),
+    selectAll(() => supabase.from('crm_tasks').select('task_key,member_id,kind,done_at,done_by,result,method,next_on').not('member_id', 'is', null).gte('done_at', new Date(Date.now() - 45 * DAY).toISOString())),
+    supabase.from('crm_attendance').select('member_id,checked_at').gte('checked_at', new Date(Date.now() - 2 * 3600e3).toISOString()),
+    selectAll(() => supabase.from('crm_payments').select('member_id,paid_at,amount').gte('paid_at', new Date(Date.now() - 45 * DAY).toISOString())),
+  ]);
+  const cell = (dLeft, band) => (model.tables[horizonOf(dLeft)] || model.bands).find((b) => b.band === band) || { p: 0, n: 0 };
+  const paidAfter = (mid, iso) => pays.some((x) => x.member_id === mid && x.amount > 0 && x.paid_at > iso);
+  // 월구독으로 이어 가는 분은 기간권이 끝나도 재등록 대상이 아니다
+  const S = await subsMap();
+  const mById = Object.fromEntries(members.filter((m) => { const ss = subState(subOf(m, S), today, m, S); return !(ss && (ss.kind === '구독 중' || ss.kind === '쉬어가기')); }).map((m) => [m.id, m]));
+  const inGym = {}; (recentAtt.data || []).forEach((a) => { inGym[a.member_id] = dayKST(a.checked_at) === today ? new Date(Date.parse(a.checked_at) + 9 * 3600e3).toISOString().slice(11, 16) : null; });
+  const lastTask = {}; tasks.filter((t) => t.kind !== 'snooze' && t.kind !== 'lockx').forEach((t) => { if (!lastTask[t.member_id] || t.done_at > lastTask[t.member_id].done_at) lastTask[t.member_id] = t; });
+  const prices = {}; passes.forEach((p) => { if (Number(p.price_paid) > 0) (prices[p.product_name] = prices[p.product_name] || []).push(Number(p.price_paid)); });
+  const medOf = Object.fromEntries(Object.entries(prices).map(([k, v]) => { v.sort((x, y) => x - y); return [k, v[Math.floor(v.length / 2)]]; }));
+  // 회원마다 지금 쓰는 기간권 중 가장 늦게 끝나는 것 (60일 안에 끝나는 회원만)
+  const cur = {};
+  passes.forEach((p) => { if (!mById[p.member_id] || !isPeriodPass(p) || !['사용 중', '홀딩', '예정'].includes(p.status) || !p.ends_on) return; if (!cur[p.member_id] || p.ends_on > cur[p.member_id].ends_on) cur[p.member_id] = p; }); // 다음 이용권(예정)을 이미 등록한 분은 끝나는 날이 뒤로 밀려 대상에서 빠진다
+  const rows = [];
+  Object.values(cur).forEach((p) => {
+    if (p.ends_on < today || p.ends_on > horizon) return;
+    const m = mById[p.member_id], set = att[p.member_id];
+    const v60 = countIn(set, addDaysYMD(today, -60), today), v14 = countIn(set, addDaysYMD(today, -14), today);
+    const dLeft = daysBetween(today, p.ends_on), band = bandOf(v60), c0 = cell(dLeft, band), prob = c0.p;
+    // 걸린 돈 = 이 회원이 낸 금액 → 없으면 같은 상품 가운데값 → 없으면 재등록 가운데값 (추정 표시)
+    const paid = Number(p.price_paid) || 0, value = paid || medOf[p.product_name] || model.renew_value || 0, est = !paid;
+    const lt = lastTask[p.member_id];
+    const action = inGym[p.member_id] ? '지금 센터에 계심 · 직접 인사하고 다음 방문 약속' : v60 === 0 ? '안부 전화 · 이번 주 방문 약속 잡기' : v60 <= 4 ? '방문 약속 문자 · 루틴 같이 봐 드리기' : '재등록 상담 · 센터 오실 때';
+    rows.push({ member_id: p.member_id, name: m.name, phone: m.phone, product: p.product_name, ends_on: p.ends_on, d_left: daysBetween(today, p.ends_on), value, est, v60, v14, band, p: Math.round(prob * 100), basis_n: c0.n, horizon: horizonOf(dLeft), risk: Math.round(value * (1 - prob)), action, in_gym: inGym[p.member_id] || null,
+      contacted: lt ? { key: lt.task_key, at: lt.done_at, by: lt.done_by, kind: TASK_LABEL[lt.kind] || lt.kind, result: lt.result || null, method: lt.method || null, next_on: lt.next_on || null, paid: paidAfter(lt.member_id, lt.done_at), visited: !!(set && [...set].some((d) => d > dayKST(lt.done_at) && d <= addDaysYMD(dayKST(lt.done_at), 7))) } : null });
+  });
+  rows.sort((a, b) => b.risk - a.risk || a.d_left - b.d_left);
+  // 연락 기록: 판정하지 않고 사실 세 가지를 나란히 센다 — 직원이 고른 결과 / 그 뒤 7일 안 방문 / 그 뒤 결제
+  const since = new Date(Date.now() - 30 * DAY).toISOString(), byResult = {};
+  let done = 0, visited = 0, waiting = 0, paid = 0;
+  tasks.filter((t) => t.done_at >= since && t.kind !== 'snooze' && t.kind !== 'lockx').forEach((t) => {
+    const d0 = dayKST(t.done_at), d7 = addDaysYMD(d0, 7), set = att[t.member_id];
+    const hit = !!(set && [...set].some((d) => d > d0 && d <= d7)), pd = paidAfter(t.member_id, t.done_at);
+    const k = (t.result || '').split(' · ')[0] || '결과 안 적음'; byResult[k] = byResult[k] || { n: 0, visited: 0, paid: 0 };
+    done++; byResult[k].n++; if (hit) { visited++; byResult[k].visited++; } else if (d7 >= today) waiting++;
+    if (pd) { paid++; byResult[k].paid++; }
+  });
+  const sum = (f) => rows.reduce((a, r) => a + f(r), 0);
+  return [200, {
+    today, model, rows,
+    totals: { members: rows.length, value: sum((r) => r.value), est: rows.filter((r) => r.est).length, risk: sum((r) => r.risk), expected: Math.round(sum((r) => r.p) / 100), low: rows.filter((r) => r.v60 <= 4).length },
+    outcomes: { days: 30, contacts: done, visited, paid, waiting, byResult: Object.entries(byResult).map(([k, x]) => ({ result: k, ...x })).sort((a, b) => b.n - a.n) },
+  }];
+}
+
+// ---------- 오늘: 할 일은 한 줄 (제1원리) ----------
+// 원자 5개(고객·이용권·방문·결제·연락)에서 나온 '지금 해야 할 연락'만 남긴다.
+// 순서 = 언제까지(지금 → 오늘 → 이번 주) → 지켜야 할 매출이 큰 순. 센터에 계신 분은 항상 맨 위.
+const DUE = { now: 0, today: 1, week: 2 };
+const DUE_OF = { '지금 바로': 'now', '오늘 안에': 'today', '이번 주 안에': 'week' };
+async function todayQueue() {
+  const [[, d], [, e]] = await Promise.all([dashboard(), renewEngine()]);
+  const today = e.today, items = [];
+  const rv = new Set(e.rows.map((r) => r.member_id));
+  let waiting = 0;
+  let scheduled = 0;
+  e.rows.forEach((r) => {
+    const c = r.contacted, cDay = c ? dayKST(c.at) : null, doneToday = cDay === today;
+    let again = false;
+    if (c && !doneToday) {
+      if (c.next_on) { if (c.next_on > today) { scheduled++; return; } again = true; } // 다음 연락일 전까지는 쉰다
+      else if (daysBetween(cDay, today) <= 14) { if (!c.visited) waiting++; return; } // 연락했으니 오시는지 지켜보는 중
+    }
+    if (!again && !doneToday && !r.in_gym && r.v60 >= 5 && r.d_left > 14) return; // 잘 오시는 분은 끝나기 2주 전까지 그냥 둔다
+    const due = r.in_gym || r.d_left <= 3 ? 'now' : again || r.d_left <= 14 || r.v60 === 0 ? 'today' : 'week';
+    const how = r.v60 === 0 ? '두 달 동안 한 번도 안 오셨어요' : `두 달 동안 ${r.v60}번 오셨어요`;
+    const act = r.in_gym ? '직접 인사하고 다음 방문 약속 잡기' : r.v60 === 0 ? '안부 전화로 이번 주 방문 약속 잡기' : r.v60 <= 4 ? '방문 약속 문자 보내기' : '재등록 상담하기';
+    items.push({ key: doneToday && /^rv:/.test(c.key) ? c.key : `rv:${r.member_id}:${today}`, kind: 'renew', member_id: r.member_id, name: r.name, phone: r.phone, in_gym: r.in_gym,
+      d_left: r.d_left, v60: r.v60, verb: r.in_gym ? 'meet' : r.v60 === 0 ? 'call' : r.v60 <= 4 ? 'text' : 'meet',
+      tag: again ? '다시 연락하는 날' : r.d_left === 0 ? '오늘 끝나요' : `D-${r.d_left}`, why: `${r.product} · ${how}`, action: act, stake: r.risk, stake_est: r.est,
+      basis: { of10: Math.round(r.p / 10), n: r.basis_n }, due,
+      done: doneToday, done_by: doneToday ? c.by : null, done_at: doneToday ? c.at : null, result: doneToday ? c.result : null, next_on: doneToday ? c.next_on : null });
+  });
+  (d.tasks || []).forEach((t) => {
+    if (t.snoozed) return;
+    if (t.member_id && rv.has(t.member_id) && /^(exp|abs14|abs30|nov|new):/.test(t.key)) return; // 재등록 줄에서 이미 챙김
+    items.push({ key: t.key, kind: t.kind, member_id: t.member_id, inquiry_id: t.inquiry_id || null, name: t.name, phone: t.phone, in_gym: t.in_gym,
+      verb: t.in_gym ? 'meet' : /문자/.test(t.action) ? 'text' : 'call',
+      tag: t.tag, why: [t.title, ...(t.sub || []).slice(0, 1)].join(' · '), action: t.action, stake: null, due: t.in_gym ? 'now' : DUE_OF[t.group] || 'week',
+      done: !!t.done, done_by: t.done_by || null, done_at: t.done_at || null, result: t.done ? t.result || null : null });
+  });
+  items.sort((a, b) => (a.done - b.done) || (!!b.in_gym - !!a.in_gym) || DUE[a.due] - DUE[b.due] || (b.stake || 0) - (a.stake || 0) || String(a.name).localeCompare(String(b.name)));
+  const open = items.filter((x) => !x.done);
+  return [200, {
+    today, now: new Date().toISOString(), items,
+    stake: { total: e.totals.risk, members: e.totals.members, est: e.totals.est },
+    counts: { open: open.length, done: items.length - open.length, now: open.filter((x) => x.due === 'now').length, waiting, scheduled },
+    outcome: e.outcomes, model: e.model.tables[14].map((b) => ({ band: b.band, of10: Math.round(b.p * 10), n: b.n })), model_total: e.model.total,
+    staff: d.staff, workMissing: d.workMissing,
+    map: e.rows.map((r) => ({ member_id: r.member_id, name: r.name, d_left: r.d_left, v60: r.v60, value: r.value, risk: r.risk, p: r.p })),
+  }];
 }
 
 // ---------- 브로제이 회원 사진 가져오기 (한 번) ----------
@@ -1347,7 +1553,7 @@ async function subLocker({ member_id, locker_no, staff }) {
 
 // ---------- 예약 작업 (서울 서버 예약 기능이 정해진 시간에 부른다) ----------
 // tick(5분마다): 서버 깨워두기 + 월구독 자동결제 기록 / nightly(매일 0시 5분): 이용권·락커·회원 단계 정리
-// report(매일 밤 10시): 하루 요약 알림 / weekly(월요일 아침 9시): 지난주 요약 알림
+// report(매일 밤 11시 30분): 하루 요약 알림 / weekly(월요일 아침 9시): 지난주 요약 알림
 async function cronOk(key) {
   const { data, error } = await supabase.from('admin_settings').select('value').eq('key', 'cron_secret').maybeSingle();
   if (error || !data || !data.value || !key) return false;
@@ -1451,7 +1657,7 @@ async function reportPush({ endpoint, on }) {
   if (on === 'test') { const sub = await supabase.from('crm_push_subs').select('endpoint,p256dh,auth').eq('endpoint', ep).maybeSingle(); if (sub.data) { const r = await dailyReportMsg(); await pushSend(r, sub.data); } }
   return [200, { on: eps.has(ep), count: eps.size }];
 }
-async function dailyReportMsg() { const to = await reportTargets(); return { title: '매일 요약 받기가 켜졌어요', body: '매일 밤 10시에 오늘 매출·출석·할 일을 보내드려요', tag: `report-test-${Date.now()}`, _n: to.length }; }
+async function dailyReportMsg() { const to = await reportTargets(); return { title: '매일 요약 받기가 켜졌어요', body: '매일 밤 11시 30분에 오늘 매출·출석·할 일을 보내드려요', tag: `report-test-${Date.now()}`, _n: to.length }; }
 
 // ---------- 등록·결제 입력 ----------
 async function products() {
@@ -1973,7 +2179,8 @@ async function withListExtras(rows, today) {
   }); });
   at.forEach((d) => uniqDays(d).forEach((a) => { visits[a.member_id] = (visits[a.member_id] || 0) + 1; }));
   ptPays.forEach((d) => d.forEach((p) => { if (!ptName[p.member_id]) ptName[p.member_id] = 'PT'; }));
-  return rows.map((m) => ({ ...m, pass_name: passName[m.id] ? passName[m.id].product_name : null, pt_name: ptName[m.id] || (hasPtTag(m) ? 'PT' : null), month_visits: visits[m.id] || 0, registered_on: [regOn[m.id], m.first_started_on].filter(Boolean).sort()[0] || null }));
+  const subName = (m) => (m.sub_plan && (m.sub === '구독 중' || m.sub === '쉬어가기' || (m.sub_end && m.sub_end >= today)) ? `${m.sub_plan} 구독권` : null);
+  return rows.map((m) => ({ ...m, pass_name: subName(m) || (passName[m.id] ? passName[m.id].product_name : null), pt_name: ptName[m.id] || (hasPtTag(m) ? 'PT' : null), month_visits: visits[m.id] || 0, registered_on: [regOn[m.id], m.first_started_on].filter(Boolean).sort()[0] || null }));
 }
 async function members({ q = '', stage = '', limit = 60, offset = 0, sort = '', dir = '' }) {
   const today = todayKST();
@@ -2055,10 +2262,27 @@ async function memberAttendance({ id, month }) {
   if (error) throw error;
   return [200, { month: ym, rows: data.map((r) => ({ at: r.checked_at, via: r.via || null })), total: cnt.count || 0, first, last }];
 }
+// 고객 상태 세 갈래 — 전부 원본(이용권·문의·결제·방문·연락)에서 계산하고 저장하지 않는다
+function status3(m, today, lastContact, visitDays) {
+  const expired = m.stage === '만료·이탈';
+  const use = expired ? '만료' : m.holding ? '홀딩' : '이용 중';
+  const started = m.first_started_on ? daysBetween(m.first_started_on, today) : null;
+  const sales = m.stage === '체험' ? '체험' : expired ? '이탈'
+    : m.days_left != null && (m.days_left <= 14 || (m.days_left <= 60 && !(started != null && started <= 30))) ? '재등록 대상'
+    : started != null && started <= 30 ? '신규' : '유지';
+  let care = expired ? null : m.days_absent == null || m.days_absent >= 30 ? '안 옴' : m.days_absent >= 14 ? '뜸해짐' : '꾸준함';
+  let care_note = null;
+  if (lastContact) {
+    const cDay = kstDate(lastContact.done_at);
+    if (lastContact.next_on && lastContact.next_on >= today) { care = '연락 예정'; care_note = `${+lastContact.next_on.slice(5, 7)}.${+lastContact.next_on.slice(8)}`; }
+    else if (daysBetween(cDay, today) <= 14 && !(visitDays || []).some((d) => d > cDay)) { care = '연락 후 대기'; care_note = `${+cDay.slice(5, 7)}.${+cDay.slice(8)} ${lastContact.done_by || ''}`.trim(); }
+  }
+  return { use, sales, care, care_note };
+}
 async function member({ id }) {
   if (!id) return [400, { error: '필수 정보 누락' }];
   const today = todayKST();
-  const [m, passes, payments, lockers, inquiries, events, att, S] = await Promise.all([
+  const [m, passes, payments, lockers, inquiries, events, att, S, lastC] = await Promise.all([
     supabase.from('crm_members').select('*').eq('id', id).maybeSingle(),
     supabase.from('crm_passes').select('id,product_name,category,status,starts_on,ends_on,total_count,remaining_count,trainer,price_paid,registered_on,legacy_id').eq('member_id', id).order('starts_on', { ascending: true }),
     supabase.from('crm_payments').select('id,amount,list_price,discount_reason,kind,method,method_split,method_note,staff_name,paid_at,pass_id,item,sales_excluded').eq('member_id', id).order('paid_at', { ascending: true }),
@@ -2067,6 +2291,7 @@ async function member({ id }) {
     supabase.from('crm_events').select('kind,body,staff_name,at').eq('member_id', id).order('at', { ascending: false }).limit(30),
     supabase.from('crm_attendance').select('checked_at').eq('member_id', id).gte('checked_at', new Date(Date.now() - 56 * DAY).toISOString()),
     subsMap(),
+    supabase.from('crm_tasks').select('task_key,kind,done_at,done_by,result,method,next_on').eq('member_id', id).neq('kind', 'snooze').order('done_at', { ascending: false }).limit(1),
   ]);
   if (events.error || att.error) throw events.error || att.error;
   const weeks = Array(8).fill(0);
@@ -2079,8 +2304,12 @@ async function member({ id }) {
   // 체험 여부는 이 회원 이용권만 보고 판단 (전체 이용권을 다시 안 읽는다)
   const livePs = (passes.data || []).filter((p) => ['사용 중', '예정', '홀딩'].includes(p.status));
   const trialSet = new Set(livePs.length && livePs.every((p) => /체험|^PT ?3회$/.test(p.product_name || '')) ? [id] : []);
+  const dm = markTrial([decorate(safe, today, S)], trialSet)[0];
+  const lc = (lastC.data || [])[0] || null, visitDays = [...new Set(att.data.map((a) => kstDate(a.checked_at)))];
   return [200, {
-    member: { ...markTrial([decorate(safe, today, S)], trialSet)[0], photo_url: await photoUrl(photo_path),
+    status: status3(dm, today, lc, visitDays),
+    visits: att.data.map((a) => a.checked_at).sort().reverse(),
+    member: { ...dm, photo_url: await photoUrl(photo_path),
       subscription: sb ? { id: sb.id, name: sb.name, plan: sb.plan, addons: sb.addons || [], status: sb.status, next_billing_date: sb.next_billing_date, phone4: digitsOf(sb.phone).slice(-4), linked: safe.subscriber_id === sb.id } : null },
     passes: passes.data, payments: payments.data,
     lockers: lockers.data.map(({ lock_code, ...l }) => l),
@@ -2427,7 +2656,7 @@ async function tokenOk(tk) {
   return ok;
 }
 
-const ACTIONS = { dashboard, members, member, memberAttendance, salesDays, lockerBoard, kioskRegister, checkinFind, checkin, photoUpload, staffPunch, staffCall, staffAttendance, staffAttendanceSave,
+const ACTIONS = { dashboard, members, member, memberAttendance, renewEngine, renewCheck, todayQueue, contactUpdate, salesDays, lockerBoard, kioskRegister, checkinFind, checkin, photoUpload, staffPunch, staffCall, staffAttendance, staffAttendanceSave,
   taskDone, taskUndo, staffList, staffAdd, staffRemove, financeGet, financeSave, salesYear, subSearch, subLink, staffUpdate, rolesSave, report, memoAdd, inquiryAdd, inquiryList, inquiryUpdate, ptBoard, revenue, msgRules, msgRulesSave, ptSession, ptAssign, ptSetLeft, notionSync, passUpdate, paymentMethod, staffOrder, roleColor, taskSnooze, reportV2, attendanceDay, pushKey, pushSubscribe, pushTest, pushWho, products, register, registerUndo, regInquiries, subLocker, reportPush };
 const KIOSK_OK = ['checkinFind', 'checkin', 'photoUpload', 'staffPunch', 'staffCall'];
 const WRITES = ['checkin', 'photoUpload', 'taskDone', 'taskUndo', 'staffAdd', 'staffUpdate', 'staffRemove', 'financeSave', 'subLink', 'rolesSave', 'memoAdd', 'inquiryAdd', 'inquiryUpdate', 'msgRulesSave', 'ptSession', 'ptAssign', 'ptSetLeft', 'notionSync', 'passUpdate', 'paymentMethod', 'staffOrder', 'roleColor', 'taskSnooze', 'pushSubscribe', 'pushTest', 'register', 'registerUndo', 'subLocker', 'reportPush'];
