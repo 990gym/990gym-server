@@ -146,6 +146,7 @@ function lockerTotal(rows) {
 // 매출 묶음: PT는 따로(+α), 나머지는 전부 회원권(헬스·월구독·GX·락커 등)
 function salesGroup(name, cat) {
   const n = String(name || '');
+  if (/^(락커|운동복|수건|양도|일일권)/.test(n.trim())) return '기타'; // '락커 · 10개월' 처럼 개월이 들어가도 헬스가 아니다
   if (cat === 'PT' || /PT|피티/i.test(n)) return 'PT';
   if (cat === 'GX 무제한' || /GX|스피닝|줌바|요가|필라|VIP|V\.I\.P|올엑세스|올액세스/.test(n)) return 'GX';
   if (cat === '월구독' || /구독/.test(n)) return '월구독';
