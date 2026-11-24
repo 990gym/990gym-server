@@ -805,7 +805,7 @@ async function reportV2({ ym, week }) {
     const d = kstDate(q.inquired_at), ph = digits(q.phone), keys = nameKeys(q.name);
     const mids = members.filter((x) => x.id === q.member_id || (ph && digits(x.phone) === ph) || keys.includes(bare(x.name))).map((x) => x.id);
     const after = iso(Date.parse(d) - 3 * DAY);
-    return !mids.some((mid) => (byMember[mid] || []).some((x) => !isTrialName(x.product_name) && (x.registered_on || x.starts_on || '') >= after));
+    return !mids.some((mid) => (byMember[mid] || []).some((x) => (x.registered_on || x.starts_on || '') >= after)); // 체험 등록도 등록 확인으로 본다
   }).map((q) => ({ name: q.name, day: kstDate(q.inquired_at), source: q.source || null, interest: parseInqSummary(q.summary).interest || null }))
     .sort((a, b) => b.day.localeCompare(a.day));
   const noReg = {}; qIn.forEach((q) => { const r = parseInqSummary(q.summary).reason; if (r) noReg[r] = (noReg[r] || 0) + 1; });
@@ -1436,7 +1436,8 @@ async function register({ inquiry_id, member_id, new_member, product_id, custom,
   const s = starts_on || today;
   if (!isDate(s)) return [400, { error: '시작일을 다시 확인해주세요' }];
   const isPT = salesGroup(prod.name, prod.category) === 'PT';
-  let e = ends_on || (prod.months ? ymdAddMonths(s, prod.months) : null);
+  // 체험(체험 PT 3회 등)은 시작일부터 14일이 만료
+  let e = ends_on || (prod.months ? ymdAddMonths(s, prod.months) : (prod.category === '체험' || isTrialPT(prod.name, Number(String(amount ?? '').replace(/[^\d]/g, ''))) ? addDaysYMD(s, 13) : null));
   if (e && !isDate(e)) return [400, { error: '만료일을 다시 확인해주세요' }];
   if (e && e < s) return [400, { error: '만료일이 시작일보다 빨라요' }];
   const cnt = sessions != null && sessions !== '' ? Math.max(1, Math.min(200, Math.round(+sessions))) : prod.sessions;
