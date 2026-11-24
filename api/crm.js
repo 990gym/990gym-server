@@ -386,6 +386,15 @@ async function dashboardRaw() {
   (staff.data || []).forEach((s) => { staffStats[s.name] = { today: 0, month: 0 }; });
   doneRows.filter((r) => r.done_at >= monthStartISO).forEach((r) => { const s = (staffStats[r.done_by] = staffStats[r.done_by] || { today: 0, month: 0 }); s.month++; if (kstDate(r.done_at) === today) s.today++; });
 
+  // 직원 퇴근 미기록 (지난 2주, 오늘 제외) → 매니저가 출근부에서 입력
+  let workMissing = [];
+  try {
+    const wm = await supabase.from('crm_staff_attendance').select('id,staff_id,work_date,in_at').is('out_at', null).lt('work_date', today).gte('work_date', iso2(Date.parse(today) - 14 * DAY));
+    if (!wm.error && wm.data && wm.data.length) {
+      const nm = Object.fromEntries(((await supabase.from('crm_staff').select('id,name')).data || []).map((x) => [x.id, x.name]));
+      workMissing = wm.data.map((r) => ({ id: r.id, name: nm[r.staff_id] || '-', day: r.work_date, in: kstHM(r.in_at) })).sort((a, b) => b.day.localeCompare(a.day));
+    }
+  } catch (e) { workMissing = []; }
   const thisMonthLapsed = all.filter((m) => m.stage === '만료·이탈' && m.ends_on && m.ends_on.slice(0, 7) === month).length;
   return [200, {
     today, now: new Date().toISOString(),
@@ -402,7 +411,7 @@ async function dashboardRaw() {
     stages, comp, pt, trend,
     attendance: { now: Object.keys(inGym).length, today: seenToday.size, hours, usual: usual.map((v) => Math.round((v / nUsual) * 10) / 10), hasUsual: usualDays.size > 0 },
     sales: { month, days, byGroup: sales, membership, pt: sales.PT, total: membership + sales.PT, daily, target: finance.target, breakeven: finance.breakeven, floor: finance.floor, ptPay: finance.ptPay, profit: finance.profit },
-    tasks: list, doneToday: doneToday.length,
+    tasks: list, doneToday: doneToday.length, workMissing,
     staff: sortStaff(staff.data || [], smeta.order).map((s) => ({ ...s, ...(staffStats[s.name] || { today: 0, month: 0 }) })),
     roleColors: roleColorsOf(sroles, smeta.colors),
   }];
@@ -1108,6 +1117,7 @@ async function notionSync({ force } = {}) {
 // ---------- 이용권 수정 · 결제 방법 ----------
 const PAY_METHODS = ['카드', '현금', '계좌이체'];
 const PASS_STATUS = ['사용 중', '예정', '홀딩', '만료', '무효'];
+const iso2 = (t) => new Date(t).toISOString().slice(0, 10);
 const isDate = (v) => /^\d{4}-\d{2}-\d{2}$/.test(String(v || ''));
 async function passUpdate({ id, product_name, status, starts_on, ends_on, total_count, remaining_count, price_paid, method, staff }) {
   if (!id) return [400, { error: '필수 정보 누락' }];
@@ -1651,7 +1661,7 @@ async function staffMeta() {
 const sortStaff = (list, order) => list.slice().sort((a, b) => { const x = order.indexOf(a.id), y = order.indexOf(b.id); return (x < 0 ? 1e9 : x) - (y < 0 ? 1e9 : y); });
 const roleColorsOf = (roles, colors) => Object.fromEntries(roles.map((r, i) => [r, ROLE_COLORS.includes(colors[r]) ? colors[r] : ROLE_COLORS[i % ROLE_COLORS.length]]));
 async function staffList() {
-  const [{ data, error }, roles, meta] = await Promise.all([supabase.from('crm_staff').select('id,name,role,active').eq('active', true).order('created_at'), getRoles(), staffMeta()]);
+  const [{ data, error }, roles, meta] = await Promise.all([supabase.from('crm_staff').select('id,name,role,active,phone').eq('active', true).order('created_at'), getRoles(), staffMeta()]);
   if (error) throw error;
   return [200, { staff: sortStaff(data, meta.order), roles, roleColors: roleColorsOf(roles, meta.colors), colorNames: ROLE_COLORS }];
 }
@@ -1669,19 +1679,32 @@ async function roleColor({ role, color }) {
   return staffList();
 }
 const cleanRole = (role, roles) => (role && roles.includes(String(role).trim()) ? String(role).trim() : null);
-async function staffAdd({ name, role }) {
+// 직원 휴대폰 번호: 태블릿에서 11자리를 누르면 출퇴근이 찍힌다. 비워 두면 출퇴근을 안 쓰는 직원.
+async function staffPhoneCheck(phone, selfId) {
+  const d = String(phone || '').replace(/\D/g, '');
+  if (!d) return { phone: null };
+  if (!/^010\d{8}$/.test(d)) return { error: '휴대폰 번호 11자리(010…)를 적어주세요' };
+  const { data, error } = await supabase.from('crm_staff').select('id,name,phone').eq('active', true);
+  if (error) throw error;
+  const dup = data.find((x) => x.id !== selfId && String(x.phone || '').replace(/\D/g, '') === d);
+  if (dup) return { error: `${dup.name}님과 같은 번호예요` };
+  return { phone: `${d.slice(0, 3)}-${d.slice(3, 7)}-${d.slice(7)}` };
+}
+async function staffAdd({ name, role, phone }) {
   const n = String(name || '').trim().slice(0, 20);
   if (!n) return [400, { error: '이름을 적어주세요' }];
+  const ph = await staffPhoneCheck(phone, null);
+  if (ph.error) return [400, { error: ph.error }];
   const r = cleanRole(role, await getRoles());
   const ex = await supabase.from('crm_staff').select('id').eq('name', n).maybeSingle();
   if (ex.error) throw ex.error;
-  const q = ex.data ? supabase.from('crm_staff').update({ role: r, active: true }).eq('id', ex.data.id) : supabase.from('crm_staff').insert({ name: n, role: r, active: true });
+  const q = ex.data ? supabase.from('crm_staff').update({ role: r, active: true, ...(ph.phone ? { phone: ph.phone } : {}) }).eq('id', ex.data.id) : supabase.from('crm_staff').insert({ name: n, role: r, active: true, phone: ph.phone });
   const { error } = await q;
   if (error) throw error;
   return staffList();
 }
 // 이름·직책 고치기. 이름을 바꾸면 이번 달 처리 기록의 이름도 같이 바꾼다.
-async function staffUpdate({ id, name, role }) {
+async function staffUpdate({ id, name, role, phone }) {
   const n = String(name || '').trim().slice(0, 20);
   if (!id || !n) return [400, { error: '이름을 적어주세요' }];
   const cur = await supabase.from('crm_staff').select('id,name').eq('id', id).maybeSingle();
@@ -1690,7 +1713,9 @@ async function staffUpdate({ id, name, role }) {
   const dup = await supabase.from('crm_staff').select('id').eq('name', n).eq('active', true).maybeSingle();
   if (dup.error) throw dup.error;
   if (dup.data && dup.data.id !== id) return [400, { error: '같은 이름이 이미 있어요' }];
-  const { error } = await supabase.from('crm_staff').update({ name: n, role: cleanRole(role, await getRoles()) }).eq('id', id);
+  const ph = phone === undefined ? null : await staffPhoneCheck(phone, id);
+  if (ph && ph.error) return [400, { error: ph.error }];
+  const { error } = await supabase.from('crm_staff').update({ name: n, role: cleanRole(role, await getRoles()), ...(ph ? { phone: ph.phone } : {}) }).eq('id', id);
   if (error) throw error;
   if (cur.data.name !== n) {
     const t = await supabase.from('crm_tasks').update({ done_by: n }).eq('done_by', cur.data.name);
@@ -2193,6 +2218,104 @@ async function checkin({ id }) {
   return [200, out];
 }
 
+// ---------- 직원 출퇴근 (입실 태블릿에서 휴대폰 번호 11자리) ----------
+// 그날 처음 = 출근, 출근 중에 또 = 퇴근. 2분 안에 또 누른 건 실수로 보고 무시. 퇴근을 안 찍은 날은 매니저가 출근부에서 고친다.
+const minsTxt = (n) => (n >= 60 ? `${Math.floor(n / 60)}시간${n % 60 ? ` ${n % 60}분` : ''}` : `${n}분`);
+const minsOf = (r) => (r.in_at && r.out_at ? Math.max(0, Math.round((Date.parse(r.out_at) - Date.parse(r.in_at)) / 60000)) : 0);
+const kstHM = (iso) => new Date(Date.parse(iso) + 9 * 3600e3).toISOString().slice(11, 16);
+// 출퇴근 알림은 대표·매니저 폰으로 (폰 주인을 모르는 기존 등록 폰도 받는다)
+async function pushToLeads(msg) {
+  const [subs, st] = await Promise.all([
+    supabase.from('crm_push_subs').select('endpoint,p256dh,auth,staff_name'),
+    supabase.from('crm_staff').select('name,role').eq('active', true),
+  ]);
+  const leads = new Set((st.data || []).filter((x) => /대표|매니저|실장/.test(x.role || '')).map((x) => x.name));
+  const list = (subs.data || []).filter((x) => !x.staff_name || leads.has(x.staff_name));
+  await Promise.all(list.map((x) => pushSend(msg, x)));
+}
+async function staffPunch({ phone }) {
+  const d = String(phone || '').replace(/\D/g, '');
+  if (!/^010\d{8}$/.test(d)) return [400, { error: '휴대폰 번호 11자리를 눌러주세요' }];
+  const st = await supabase.from('crm_staff').select('id,name,role,phone').eq('active', true);
+  if (st.error) throw st.error;
+  const s = st.data.find((x) => String(x.phone || '').replace(/\D/g, '') === d);
+  if (!s) return [404, { error: '직원 명단에 없는 번호예요. 매니저에게 말씀해 주세요.' }];
+  const today = todayKST(), now = Date.now();
+  const rows = await supabase.from('crm_staff_attendance').select('id,in_at,out_at').eq('staff_id', s.id).eq('work_date', today).order('in_at');
+  if (rows.error) throw rows.error;
+  const list = rows.data || [];
+  let open = list.find((r) => !r.out_at);
+  // 자정 넘겨 퇴근: 오늘 기록이 없고 어제 출근이 16시간 안이면 그 기록의 퇴근으로
+  if (!list.length) {
+    const y = await supabase.from('crm_staff_attendance').select('id,in_at,out_at').eq('staff_id', s.id).eq('work_date', addDaysYMD(today, -1)).is('out_at', null).order('in_at', { ascending: false }).limit(1);
+    if (!y.error && y.data && y.data[0] && now - Date.parse(y.data[0].in_at) < 16 * 3600e3) { open = y.data[0]; list.push(open); }
+  }
+  const lastOut = list.filter((r) => r.out_at).map((r) => Date.parse(r.out_at)).sort().pop() || 0;
+  let kind, at = new Date(now).toISOString(), dup = false;
+  if (open && now - Date.parse(open.in_at) < 2 * 60000) { kind = '출근'; at = open.in_at; dup = true; }
+  else if (!open && lastOut && now - lastOut < 2 * 60000) { kind = '퇴근'; at = new Date(lastOut).toISOString(); dup = true; }
+  else if (open) {
+    const u = await supabase.from('crm_staff_attendance').update({ out_at: at }).eq('id', open.id);
+    if (u.error) throw u.error;
+    open.out_at = at; kind = '퇴근';
+  } else {
+    const ins = await supabase.from('crm_staff_attendance').insert({ staff_id: s.id, work_date: today, in_at: at, via: '태블릿' });
+    if (ins.error) throw ins.error;
+    kind = '출근';
+  }
+  const worked = list.reduce((a, r) => a + minsOf(r), 0);
+  if (!dup) await pushToLeads({ title: `[990짐] ${s.name}님 ${kind} · ${kstHM(at)}`, body: kind === '퇴근' ? `오늘 총 ${minsTxt(worked)}` : (s.role || '직원'), tag: `work-${now}` });
+  return [200, { name: s.name, role: s.role || null, kind, at, dup, worked_min: worked }];
+}
+// 출근부: 한 달 치 기록 + 직원별 근무시간. 퇴근 안 찍은 지난 날 = missing (근무시간에 안 넣음)
+async function staffAttendance({ month }) {
+  const today = todayKST();
+  const ym = /^\d{4}-\d{2}$/.test(String(month || '')) ? month : today.slice(0, 7);
+  const [y, m] = ym.split('-').map(Number);
+  const from = `${ym}-01`, to = new Date(Date.UTC(y, m, 0)).toISOString().slice(0, 10);
+  const [st, rows] = await Promise.all([
+    supabase.from('crm_staff').select('id,name,role,phone,active').order('created_at'),
+    supabase.from('crm_staff_attendance').select('id,staff_id,work_date,in_at,out_at,note,edited_by').gte('work_date', from).lte('work_date', to).order('work_date', { ascending: false }).order('in_at', { ascending: false }),
+  ]);
+  if (st.error || rows.error) throw st.error || rows.error;
+  const byId = Object.fromEntries(st.data.map((x) => [x.id, x]));
+  const recs = rows.data.map((r) => ({ ...r, name: (byId[r.staff_id] || {}).name || '-', minutes: minsOf(r), missing: !r.out_at && r.work_date < today, working: !r.out_at && r.work_date === today }));
+  const staff = st.data.filter((x) => (x.active && x.phone) || recs.some((r) => r.staff_id === x.id)).map((x) => {
+    const mine = recs.filter((r) => r.staff_id === x.id);
+    return { id: x.id, name: x.name, role: x.role, phone: x.phone, active: x.active, days: new Set(mine.map((r) => r.work_date)).size, minutes: mine.reduce((a, r) => a + r.minutes, 0), missing: mine.filter((r) => r.missing).length, working: mine.some((r) => r.working) };
+  });
+  return [200, { month: ym, today, staff, rows: recs }];
+}
+// 출근부 고치기·추가·지우기 (시각은 한국 시각 HH:MM)
+async function staffAttendanceSave({ id, staff_id, work_date, in_time, out_time, remove, staff }) {
+  const by = staff ? String(staff).slice(0, 20) : null;
+  if (remove) {
+    if (!id) return [400, { error: '필수 정보 누락' }];
+    const { error } = await supabase.from('crm_staff_attendance').delete().eq('id', id);
+    if (error) throw error;
+    return [200, { ok: true }];
+  }
+  const hm = /^([01]\d|2[0-3]):[0-5]\d$/;
+  let day = work_date, sid = staff_id;
+  if (id) {
+    const cur = await supabase.from('crm_staff_attendance').select('staff_id,work_date').eq('id', id).maybeSingle();
+    if (cur.error) throw cur.error;
+    if (!cur.data) return [404, { error: '기록을 찾을 수 없어요' }];
+    day = cur.data.work_date; sid = cur.data.staff_id;
+  }
+  if (!isDate(day) || !sid) return [400, { error: '날짜와 직원을 골라주세요' }];
+  if (!hm.test(String(in_time || ''))) return [400, { error: '출근 시각을 확인해주세요' }];
+  if (out_time && !hm.test(String(out_time))) return [400, { error: '퇴근 시각을 확인해주세요' }];
+  const inAt = new Date(`${day}T${in_time}:00+09:00`).toISOString();
+  let outAt = out_time ? new Date(`${day}T${out_time}:00+09:00`).toISOString() : null;
+  if (outAt && outAt <= inAt) outAt = new Date(Date.parse(outAt) + DAY).toISOString(); // 자정 넘긴 퇴근
+  const row = { in_at: inAt, out_at: outAt, edited_by: by };
+  const q = id ? supabase.from('crm_staff_attendance').update(row).eq('id', id) : supabase.from('crm_staff_attendance').insert({ ...row, staff_id: sid, work_date: day, via: '직접 입력' });
+  const { error } = await q;
+  if (error) throw error;
+  return [200, { ok: true }];
+}
+
 // 첫 입실 사진 (태블릿 카메라). jpeg base64, 1MB 이하
 async function photoUpload({ id, image }) {
   if (!id || typeof image !== 'string') return [400, { error: '필수 정보 누락' }];
@@ -2221,9 +2344,9 @@ async function tokenOk(tk) {
   return ok;
 }
 
-const ACTIONS = { dashboard, members, member, salesDays, lockerBoard, kioskRegister, checkinFind, checkin, photoUpload,
+const ACTIONS = { dashboard, members, member, salesDays, lockerBoard, kioskRegister, checkinFind, checkin, photoUpload, staffPunch, staffAttendance, staffAttendanceSave,
   taskDone, taskUndo, staffList, staffAdd, staffRemove, financeGet, financeSave, salesYear, subSearch, subLink, staffUpdate, rolesSave, report, memoAdd, inquiryAdd, inquiryList, inquiryUpdate, ptBoard, revenue, msgRules, msgRulesSave, ptSession, ptAssign, ptSetLeft, notionSync, passUpdate, paymentMethod, staffOrder, roleColor, taskSnooze, reportV2, attendanceDay, pushKey, pushSubscribe, pushTest, products, register, registerUndo, regInquiries, subLocker, reportPush };
-const KIOSK_OK = ['checkinFind', 'checkin', 'photoUpload'];
+const KIOSK_OK = ['checkinFind', 'checkin', 'photoUpload', 'staffPunch'];
 const WRITES = ['checkin', 'photoUpload', 'taskDone', 'taskUndo', 'staffAdd', 'staffUpdate', 'staffRemove', 'financeSave', 'subLink', 'rolesSave', 'memoAdd', 'inquiryAdd', 'inquiryUpdate', 'msgRulesSave', 'ptSession', 'ptAssign', 'ptSetLeft', 'notionSync', 'passUpdate', 'paymentMethod', 'staffOrder', 'roleColor', 'taskSnooze', 'pushSubscribe', 'pushTest', 'register', 'registerUndo', 'subLocker', 'reportPush'];
 
 export default async function handler(req, res) {
