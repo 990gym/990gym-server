@@ -2322,14 +2322,15 @@ async function lockerBoard() {
   const today = todayKST();
   const [lockers, assigns] = await Promise.all([
     selectAll(() => supabase.from('crm_lockers').select('number,room,broken').order('number')),
-    selectAll(() => supabase.from('crm_locker_assignments').select('locker_no,member_id,status,starts_on,ends_on').in('status', ['사용 중', '예정', '홀딩', '만료'])),
+    selectAll(() => supabase.from('crm_locker_assignments').select('locker_no,member_id,status,starts_on,ends_on,billing').in('status', ['사용 중', '예정', '홀딩', '만료'])),
   ]);
+  const S = await subsMap();
   const ids = [...new Set(assigns.map((a) => a.member_id))];
-  const names = {};
+  const names = {}, subBy = {};
   for (let i = 0; i < ids.length; i += 200) {
-    const { data, error } = await supabase.from('crm_members').select('id,name').in('id', ids.slice(i, i + 200));
+    const { data, error } = await supabase.from('crm_members').select('id,name,phone,subscriber_id').in('id', ids.slice(i, i + 200));
     if (error) throw error;
-    data.forEach((m) => { names[m.id] = m.name; });
+    data.forEach((m) => { names[m.id] = m.name; subBy[m.id] = subOf(m, S); });
   }
   const by = {};
   assigns.forEach((a) => {
@@ -2345,8 +2346,11 @@ async function lockerBoard() {
     const a = by[n];
     if (!a) { out.push({ number: n, state: meta[n] && meta[n].broken ? '고장' : '미배정' }); continue; }
     const left = a.ends_on ? daysBetween(today, a.ends_on) : null;
-    const state = a.status === '홀딩' ? '홀딩' : a.status === '예정' ? '예정' : left !== null && left < 0 ? '만료' : left !== null && left <= 14 ? '임박' : '활성';
-    out.push({ number: n, state, name: names[a.member_id] || null, member_id: a.member_id, starts_on: a.starts_on, ends_on: a.ends_on, days_left: left });
+    // 월구독 락커(애드온)는 매달 자동결제로 이어지므로, 구독이 살아 있는 동안은 '임박'으로 띄우지 않는다
+    const isSub = a.billing === '구독 애드온', sb = isSub ? subBy[a.member_id] : null;
+    const auto = !!(sb && ['active', 'paused'].includes(sb.status) && (sb.addons || []).includes('locker') && a.status !== '만료');
+    const state = a.status === '홀딩' ? '홀딩' : a.status === '예정' ? '예정' : auto ? '활성' : left !== null && left < 0 ? '만료' : left !== null && left <= 14 ? '임박' : '활성';
+    out.push({ number: n, state, name: names[a.member_id] || null, member_id: a.member_id, starts_on: a.starts_on, ends_on: a.ends_on, days_left: left, sub: isSub, auto, next_billing: auto ? sb.next_billing_date || null : null });
   }
   return [200, { today, rows: 8, lockers: out }];
 }
