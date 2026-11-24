@@ -1414,7 +1414,7 @@ async function dailyReport() {
     `출석 ${D.attendance.today}명 · 할 일 ${doneT}건 처리, ${open}건 남음`,
     `이번 달 ${wonShort(D.sales.total)}${pct != null ? ` (목표의 ${pct}%)` : ''} · 만료 예정 ${D.stages['만료 예정'] || 0}명${D.totals.subFail ? ` · 결제 실패 ${D.totals.subFail}명` : ''}`,
   ];
-  return pushReport({ title: `[990짐] 오늘 마감 · ${+today.slice(5, 7)}/${+today.slice(8)}(${DOW[new Date(`${today}T00:00:00Z`).getUTCDay()]})`, body: lines.join('\n'), tag: `report-${today}` });
+  return pushReport({ title: `오늘 마감 · ${+today.slice(5, 7)}/${+today.slice(8)}(${DOW[new Date(`${today}T00:00:00Z`).getUTCDay()]})`, body: lines.join('\n'), tag: `report-${today}` });
 }
 async function weeklyReport() {
   const today = todayKST();
@@ -1433,7 +1433,7 @@ async function weeklyReport() {
     `문의 ${qn}건 → 등록 ${qj}명${qn ? ` (${Math.round(qj / qn * 100)}%)` : ''}`,
     `이번 주 챙길 분: 만료 예정 ${soon}명 · 미출석 ${D.stages['미출석'] || 0}명`,
   ];
-  return pushReport({ title: `[990짐] 지난주 요약 · ${+from.toISOString().slice(5, 7)}/${+addDaysYMD(today, -7).slice(8)}~${+addDaysYMD(today, -1).slice(5, 7)}/${+addDaysYMD(today, -1).slice(8)}`, body: lines.join('\n'), tag: `weekly-${today}` });
+  return pushReport({ title: `지난주 요약 · ${+from.toISOString().slice(5, 7)}/${+addDaysYMD(today, -7).slice(8)}~${+addDaysYMD(today, -1).slice(5, 7)}/${+addDaysYMD(today, -1).slice(8)}`, body: lines.join('\n'), tag: `weekly-${today}` });
 }
 // 설정: 이 폰으로 매일 요약 받기
 async function reportPush({ endpoint, on }) {
@@ -1446,7 +1446,7 @@ async function reportPush({ endpoint, on }) {
   if (on === 'test') { const sub = await supabase.from('crm_push_subs').select('endpoint,p256dh,auth').eq('endpoint', ep).maybeSingle(); if (sub.data) { const r = await dailyReportMsg(); await pushSend(r, sub.data); } }
   return [200, { on: eps.has(ep), count: eps.size }];
 }
-async function dailyReportMsg() { const to = await reportTargets(); return { title: '[990짐] 매일 요약 받기가 켜졌어요', body: '매일 밤 10시에 오늘 매출·출석·할 일을 보내드려요', tag: `report-test-${Date.now()}`, _n: to.length }; }
+async function dailyReportMsg() { const to = await reportTargets(); return { title: '매일 요약 받기가 켜졌어요', body: '매일 밤 10시에 오늘 매출·출석·할 일을 보내드려요', tag: `report-test-${Date.now()}`, _n: to.length }; }
 
 // ---------- 등록·결제 입력 ----------
 async function products() {
@@ -2201,7 +2201,7 @@ function checkinMessage(name, r) {
   if (sub) lines.push(`월구독${r.next_billing ? ` · 다음 결제 ${r.next_billing}` : ''}`);
   else if (r.ends_on) lines.push(`종료일: ${r.ends_on}${r.days_left != null ? ` (${r.days_left}일 남음)` : ''}`);
   const head = r.again ? '다시 입실' : `출석${r.first_time ? ' · 첫 방문' : ''}`;
-  return { title: `[990짐] ${name}님 ${head} · ${hhmm()}`, body: lines.join('\n') || '정상 출석', tag: `att-${Date.now()}` };
+  return { title: `${name}님 ${head} · ${hhmm()}${r.day_total ? ` · 오늘 ${r.day_total}명째` : ''}`, body: lines.join('\n') || '정상 출석', tag: `att-${Date.now()}` };
 }
 
 async function checkin({ id }) {
@@ -2219,7 +2219,7 @@ async function checkin({ id }) {
   const base = { name: m.name, photo_url: await photoUrl(m.photo_path), needs_photo: !m.photo_path };
   if (d.stage === '만료·이탈' || m.holding) {
     const reason = m.holding ? '지금 홀딩 중이에요. 인포에 말씀해 주세요.' : '이용권이 끝났어요. 인포에 말씀해 주세요.';
-    await pushSend({ title: `[990짐] ⚠ ${m.name}님 입실 시도 · ${hhmm()}`, body: m.holding ? '홀딩 중인 회원이에요' : `이용권이 끝난 회원이에요${m.ends_on ? `\n종료일: ${m.ends_on}` : ''}`, tag: `att-${Date.now()}` });
+    await pushSend({ title: `⚠ ${m.name}님 입실 시도 · ${hhmm()}`, body: m.holding ? '홀딩 중인 회원이에요' : `이용권이 끝난 회원이에요${m.ends_on ? `\n종료일: ${m.ends_on}` : ''}`, tag: `att-${Date.now()}` });
     return [200, { ...base, blocked: true, reason }];
   }
 
@@ -2246,7 +2246,11 @@ async function checkin({ id }) {
     // 태블릿 인사말용: 지난 운동 뒤 며칠 만인지, 오늘이 몇 번째 운동인지
     gap_days: m.last_attended_on && m.last_attended_on < today ? daysBetween(m.last_attended_on, today) : null,
     visits: (m.total_visits || 0) + (again || dup ? 0 : 1) };
-  if (!dup) await pushSend(checkinMessage(m.name, out)); // 직원 폰으로 (10분 안에 또 찍은 건 안 보냄)
+  if (!dup) {
+    // 오늘 입실한 회원 수 (하루 한 명은 한 번만)
+    const dc = await supabase.from('crm_members').select('id', { count: 'exact', head: true }).eq('last_attended_on', today);
+    await pushSend(checkinMessage(m.name, { ...out, day_total: dc.error ? null : dc.count })); // 직원 폰으로 (10분 안에 또 찍은 건 안 보냄)
+  }
   return [200, out];
 }
 
@@ -2296,7 +2300,7 @@ async function staffPunch({ phone }) {
     kind = '출근';
   }
   const worked = list.reduce((a, r) => a + minsOf(r), 0);
-  if (!dup) await pushToLeads({ title: `[990짐] ${s.name}님 ${kind} · ${kstHM(at)}`, body: kind === '퇴근' ? `오늘 총 ${minsTxt(worked)}` : (s.role || '직원'), tag: `work-${now}` });
+  if (!dup) await pushToLeads({ title: `${s.name}님 ${kind} · ${kstHM(at)}`, body: kind === '퇴근' ? `오늘 총 ${minsTxt(worked)}` : (s.role || '직원'), tag: `work-${now}` });
   return [200, { name: s.name, role: s.role || null, kind, at, dup, worked_min: worked }];
 }
 // 입실 태블릿 '직원 호출' → 직원 폰 전체로 알림. 20초 안에 또 누른 건 한 번으로 친다.
@@ -2306,7 +2310,7 @@ async function staffCall() {
   if (Date.now() - last < 20000) return [200, { ok: true, again: true }];
   const at = new Date().toISOString();
   await supabase.from('crm_settings').upsert({ key: 'staff_call', value: { at }, updated_at: at }, { onConflict: 'key' });
-  await pushSend({ title: `[990짐] 🔔 직원 호출 · ${kstHM(at)}`, body: '입실 태블릿에서 직원을 찾고 있어요', tag: `call-${Date.now()}`, call: true });
+  await pushSend({ title: `🔔 직원 호출 · ${kstHM(at)}`, body: '입실 태블릿에서 직원을 찾고 있어요', tag: `call-${Date.now()}`, call: true });
   return [200, { ok: true, again: false }];
 }
 // 출근부: 한 달 치 기록 + 직원별 근무시간. 퇴근 안 찍은 지난 날 = missing (근무시간에 안 넣음)
