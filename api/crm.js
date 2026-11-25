@@ -1789,8 +1789,10 @@ async function register({ inquiry_id, member_id, new_member, product_id, custom,
     if (dup.error) throw dup.error;
     for (const d of dup.data) { const again = await recentSame(d.id, prod.name, s, amt); if (again) return again; } // 방금 저장된 걸 다시 보낸 경우
     if (dup.data.length) return [409, { error: `이미 있는 번호예요 (${dup.data.map((x) => x.name).join(', ')}). 기존 회원을 골라주세요`, existing: dup.data }];
-    const g = ['남', '여'].includes((new_member || {}).gender) ? new_member.gender : null;
-    const ins = await supabase.from('crm_members').insert({ name, phone, gender: g, stage: '체험·신규', checkin_code: digitsOf(phone).slice(-4), counselor: st, source: (new_member || {}).source ? String(new_member.source).slice(0, 30) : null }).select('id').single();
+    const g = GENDER[(new_member || {}).gender] || null;
+    const bd = parseBirth((new_member || {}).birth);
+    if (bd === false) return [400, { error: '생년월일은 6자리로 적어주세요 (예: 900315)' }];
+    const ins = await supabase.from('crm_members').insert({ name, phone, gender: g, birth: bd, stage: '체험·신규', checkin_code: digitsOf(phone).slice(-4), counselor: st, source: (new_member || {}).source ? String(new_member.source).slice(0, 30) : null }).select('id').single();
     if (ins.error) throw ins.error;
     mid = ins.data.id; created = true;
   } else {
@@ -2424,6 +2426,31 @@ function status3(m, today, lastContact, visitDays) {
   }
   return { use, sales, care, care_note };
 }
+// 생년월일: 6자리(YYMMDD) 또는 8자리. 비우면 null, 틀리면 false. 주민등록번호 뒷자리는 받지 않는다
+const GENDER = { 남: '남성', 여: '여성', 남성: '남성', 여성: '여성' };
+function parseBirth(v) {
+  const d = String(v == null ? '' : v).replace(/\D/g, '');
+  if (!d) return null;
+  let y, mo, da;
+  if (d.length === 6) { const yy = +d.slice(0, 2); y = (yy > +todayKST().slice(2, 4) ? 1900 : 2000) + yy; mo = +d.slice(2, 4); da = +d.slice(4, 6); }
+  else if (d.length === 8) { y = +d.slice(0, 4); mo = +d.slice(4, 6); da = +d.slice(6, 8); }
+  else return false;
+  const iso = `${y}-${String(mo).padStart(2, '0')}-${String(da).padStart(2, '0')}`;
+  const t = new Date(iso + 'T00:00:00Z');
+  if (isNaN(t) || t.toISOString().slice(0, 10) !== iso || y < 1920 || iso > todayKST()) return false;
+  return iso;
+}
+// 사람 카드에서 생년월일·성별 고치기
+async function memberInfo({ id, birth, gender, staff }) {
+  if (!id) return [400, { error: '필수 정보 누락' }];
+  const patch = {};
+  if (birth !== undefined) { const bd = parseBirth(birth); if (bd === false) return [400, { error: '생년월일은 6자리로 적어주세요 (예: 900315)' }]; patch.birth = bd; }
+  if (gender !== undefined) patch.gender = GENDER[gender] || null;
+  if (!Object.keys(patch).length) return [400, { error: '바꿀 내용이 없어요' }];
+  const { error } = await supabase.from('crm_members').update(patch).eq('id', id);
+  if (error) throw error;
+  return member({ id });
+}
 async function member({ id }) {
   if (!id) return [400, { error: '필수 정보 누락' }];
   const today = todayKST();
@@ -2806,7 +2833,7 @@ async function tokenOk(tk) {
   return ok;
 }
 
-const ACTIONS = { dashboard, members, member, memberAttendance, renewEngine, renewCheck, todayQueue, contactUpdate, holdStart, holdEnd, passExtend, smsTemplates, smsTemplatesSave, salesDays, lockerBoard, kioskRegister, checkinFind, checkin, photoUpload, staffPunch, staffCall, staffAttendance, staffAttendanceSave,
+const ACTIONS = { dashboard, members, member, memberAttendance, renewEngine, renewCheck, todayQueue, contactUpdate, holdStart, holdEnd, passExtend, smsTemplates, smsTemplatesSave, memberInfo, salesDays, lockerBoard, kioskRegister, checkinFind, checkin, photoUpload, staffPunch, staffCall, staffAttendance, staffAttendanceSave,
   taskDone, taskUndo, staffList, staffAdd, staffRemove, financeGet, financeSave, salesYear, subSearch, subLink, staffUpdate, rolesSave, report, memoAdd, inquiryAdd, inquiryList, inquiryUpdate, ptBoard, revenue, msgRules, msgRulesSave, ptSession, ptAssign, ptSetLeft, notionSync, passUpdate, paymentMethod, staffOrder, roleColor, taskSnooze, reportV2, attendanceDay, pushKey, pushSubscribe, pushTest, pushWho, products, register, registerUndo, regInquiries, subLocker, reportPush };
 const KIOSK_OK = ['checkinFind', 'checkin', 'photoUpload', 'staffPunch', 'staffCall'];
 const WRITES = ['checkin', 'photoUpload', 'taskDone', 'taskUndo', 'staffAdd', 'staffUpdate', 'staffRemove', 'financeSave', 'subLink', 'rolesSave', 'memoAdd', 'inquiryAdd', 'inquiryUpdate', 'msgRulesSave', 'ptSession', 'ptAssign', 'ptSetLeft', 'notionSync', 'passUpdate', 'paymentMethod', 'staffOrder', 'roleColor', 'taskSnooze', 'pushSubscribe', 'pushTest', 'register', 'registerUndo', 'subLocker', 'reportPush'];
