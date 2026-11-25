@@ -1855,7 +1855,7 @@ async function regInquiries({ q = '' } = {}) {
   else query = query.or(`name.ilike.*${key.replace(/[,()*]/g, '')}*,raw_note.ilike.*${key.replace(/[,()*]/g, '')}*`);
   const { data, error } = await query.order('inquired_at', { ascending: false }).limit(60);
   if (error) throw error;
-  return [200, { inquiries: data.filter((x) => x.result !== '등록' && (!x.legacy_id || String(x.legacy_id).startsWith('notion:'))).map((x) => ({ id: x.id, name: x.name, phone: x.phone, source: x.source, result: x.result, day: kstDate(x.inquired_at), interest: parseInqSummary(x.summary).interest || null, note: x.raw_note ? x.raw_note.slice(0, 80) : null })) }];
+  return [200, { inquiries: data.filter((x) => (key || x.result !== '등록') && (!x.legacy_id || String(x.legacy_id).startsWith('notion:'))).map((x) => ({ id: x.id, name: x.name, phone: x.phone, source: x.source, result: x.result, day: kstDate(x.inquired_at), interest: parseInqSummary(x.summary).interest || null, note: x.raw_note ? x.raw_note.slice(0, 80) : null })) }];
 }
 // 등록하면 그 사람의 문의를 '등록'으로 연결한다 (고른 문의 + 같은 번호의 문의)
 async function linkInquiries(mid, phone, inquiryId) {
