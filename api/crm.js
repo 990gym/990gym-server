@@ -2410,6 +2410,30 @@ async function passExtend({ pass_id, days, reason, locker, staff }) {
   return member({ id: p.member_id });
 }
 
+// ---------- 대표 숫자 보기 (비용·목표 매출·월별 손익) ----------
+// 로그인 비밀번호는 직원도 같이 쓰므로, 대표만 아는 숫자 PIN(4~8자리)으로 화면 가림을 푼다.
+// 가림은 화면에서만 하는 것(직원이 실수로 보지 않게)이고, 진짜로 막으려면 직원용 비밀번호를 따로 두어야 한다.
+const OWNER_PIN_KEY = 'owner_pin';
+const pinHash = (pin, salt) => crypto.scryptSync(String(pin), salt, 32).toString('base64url');
+async function ownerPinRow() { const r = await supabase.from('crm_settings').select('value').eq('key', OWNER_PIN_KEY).maybeSingle(); if (r.error) throw r.error; return r.data && r.data.value; }
+function pinMatch(pin, v) { if (!v || !v.salt || !v.hash) return false; const a = Buffer.from(pinHash(pin, v.salt)), b = Buffer.from(v.hash); return a.length === b.length && crypto.timingSafeEqual(a, b); }
+async function ownerPin({ pin, next }) {
+  const v = await ownerPinRow();
+  const okPin = (x) => /^\d{4,8}$/.test(String(x || ''));
+  if (next !== undefined) { // 새로 정하기 (처음) 또는 바꾸기 (지금 PIN 필요)
+    if (!okPin(next)) return [400, { error: '숫자 4~8자리로 정해 주세요' }];
+    if (v && !pinMatch(pin, v)) { await new Promise((r) => setTimeout(r, 800)); return [403, { error: '지금 PIN이 맞지 않아요' }]; }
+    const salt = crypto.randomBytes(12).toString('base64url');
+    const up = await supabase.from('crm_settings').upsert({ key: OWNER_PIN_KEY, value: { salt, hash: pinHash(next, salt), set_at: new Date().toISOString() }, updated_at: new Date().toISOString() }, { onConflict: 'key' });
+    if (up.error) throw up.error;
+    return [200, { ok: true }];
+  }
+  if (!v) return [200, { ok: false, needs_setup: true }];
+  if (pin === undefined || pin === '') return [200, { ok: false, needs_setup: false }]; // 상태만 묻기
+  if (!pinMatch(pin, v)) { await new Promise((r) => setTimeout(r, 800)); return [403, { error: 'PIN이 맞지 않아요' }]; }
+  return [200, { ok: true }];
+}
+
 // ---------- 환불 (원자: '결제' 한 줄(마이너스) + 이용권 상태 '환불') ----------
 // 금액은 직원이 직접 적는다. 참고 금액만 계산해서 칸에 흐리게 보여 준다:
 //   기간권 = 결제 − 쓴 일수 × (1개월 정가 ÷ 30) − 위약금 10% · 횟수권 = 결제 − 쓴 횟수 × 1회 정가 − 위약금 10%
@@ -2683,11 +2707,14 @@ async function pushWho({ endpoint }) {
 }
 // 알림 받는 폰 구분: 폰 주인(직원 명단 이름)의 직책으로 나눈다.
 // 대표·매니저 = 모든 알림, 다른 직원 = 입실 알림·직원 호출만, 명단에서 빠진 직원 = 안 보냄. 주인을 아직 안 고른 예전 폰은 모두 받는다.
+// 센터폰(공용) = 입실 알림·직원 호출·직원 출퇴근 (매출 요약은 안 받는다)
 const isLeadRole = (r) => /대표|매니저|실장/.test(r || '');
+const CENTER_PHONE = '센터폰';
 async function pushPeople() {
   const { data, error } = await supabase.from('crm_staff').select('name,role').eq('active', true);
   if (error) throw error;
-  return { active: new Set(data.map((x) => x.name)), leads: new Set(data.filter((x) => isLeadRole(x.role)).map((x) => x.name)) };
+  const leads = new Set(data.filter((x) => isLeadRole(x.role)).map((x) => x.name));
+  return { active: new Set([...data.map((x) => x.name), CENTER_PHONE]), leads, punch: new Set([...leads, CENTER_PHONE]) };
 }
 // 알림 보내기: 등록된 폰 전부 (한 곳만 고르면 only). 2초 넘게 안 기다린다. 없어진 폰은 지운다.
 async function pushSend(msg, only) {
@@ -2787,10 +2814,10 @@ async function checkin({ id }) {
 const minsTxt = (n) => (n >= 60 ? `${Math.floor(n / 60)}시간${n % 60 ? ` ${n % 60}분` : ''}` : `${n}분`);
 const minsOf = (r) => (r.in_at && r.out_at ? Math.max(0, Math.round((Date.parse(r.out_at) - Date.parse(r.in_at)) / 60000)) : 0);
 const kstHM = (iso) => new Date(Date.parse(iso) + 9 * 3600e3).toISOString().slice(11, 16);
-// 출퇴근 알림은 대표·매니저 폰으로 (폰 주인을 모르는 기존 등록 폰도 받는다)
+// 출퇴근 알림은 대표·매니저 폰과 센터폰으로 (폰 주인을 모르는 기존 등록 폰도 받는다)
 async function pushToLeads(msg) {
   const [subs, pp] = await Promise.all([supabase.from('crm_push_subs').select('endpoint,p256dh,auth,staff_name'), pushPeople()]);
-  const list = (subs.data || []).filter((x) => !x.staff_name || pp.leads.has(x.staff_name));
+  const list = (subs.data || []).filter((x) => !x.staff_name || pp.punch.has(x.staff_name));
   await Promise.all(list.map((x) => pushSend(msg, x)));
 }
 async function staffPunch({ phone }) {
@@ -2914,7 +2941,7 @@ async function tokenOk(tk) {
   return ok;
 }
 
-const ACTIONS = { dashboard, members, member, memberAttendance, renewEngine, renewCheck, todayQueue, contactUpdate, holdStart, holdEnd, passExtend, smsTemplates, smsTemplatesSave, memberInfo, refundContext, passRefund, salesDays, lockerBoard, kioskRegister, checkinFind, checkin, photoUpload, staffPunch, staffCall, staffAttendance, staffAttendanceSave,
+const ACTIONS = { dashboard, members, member, memberAttendance, renewEngine, renewCheck, todayQueue, contactUpdate, holdStart, holdEnd, passExtend, smsTemplates, smsTemplatesSave, memberInfo, refundContext, passRefund, ownerPin, salesDays, lockerBoard, kioskRegister, checkinFind, checkin, photoUpload, staffPunch, staffCall, staffAttendance, staffAttendanceSave,
   taskDone, taskUndo, staffList, staffAdd, staffRemove, financeGet, financeSave, salesYear, subSearch, subLink, staffUpdate, rolesSave, report, memoAdd, inquiryAdd, inquiryList, inquiryUpdate, ptBoard, revenue, msgRules, msgRulesSave, ptSession, ptAssign, ptSetLeft, notionSync, passUpdate, paymentMethod, staffOrder, roleColor, taskSnooze, reportV2, attendanceDay, pushKey, pushSubscribe, pushTest, pushWho, products, register, registerUndo, regInquiries, subLocker, reportPush };
 const KIOSK_OK = ['checkinFind', 'checkin', 'photoUpload', 'staffPunch', 'staffCall'];
 const WRITES = ['checkin', 'photoUpload', 'taskDone', 'taskUndo', 'staffAdd', 'staffUpdate', 'staffRemove', 'financeSave', 'subLink', 'rolesSave', 'memoAdd', 'inquiryAdd', 'inquiryUpdate', 'msgRulesSave', 'ptSession', 'ptAssign', 'ptSetLeft', 'notionSync', 'passUpdate', 'paymentMethod', 'staffOrder', 'roleColor', 'taskSnooze', 'pushSubscribe', 'pushTest', 'register', 'registerUndo', 'subLocker', 'reportPush'];
