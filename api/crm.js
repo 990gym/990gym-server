@@ -2656,6 +2656,33 @@ function kioskToken() {
   const body = Buffer.from(JSON.stringify({ scope: 'kiosk', exp: Date.now() + KIOSK_DAYS * DAY })).toString('base64url');
   return `k.${body}.${crypto.createHmac('sha256', kioskKey()).update(body).digest('base64url')}`;
 }
+// 새 열쇠(k2): 서명 재료를 DB(crm_settings 'kiosk_secret')에 둬서 미국·서울 서버가 같이 알아본다. 예전 열쇠(k.)는 미국 서버만 알아봐서 한 번 바꿔 준다.
+let ksCache = { at: 0, v: null };
+async function kioskSecret() {
+  if (ksCache.v && Date.now() - ksCache.at < 5 * 60000) return ksCache.v;
+  let r = await supabase.from('crm_settings').select('value').eq('key', 'kiosk_secret').maybeSingle();
+  if (r.error) throw r.error;
+  if (!r.data) {
+    await supabase.from('crm_settings').upsert({ key: 'kiosk_secret', value: { s: crypto.randomBytes(32).toString('base64url') }, updated_at: new Date().toISOString() }, { onConflict: 'key', ignoreDuplicates: true });
+    r = await supabase.from('crm_settings').select('value').eq('key', 'kiosk_secret').maybeSingle();
+    if (r.error) throw r.error;
+  }
+  ksCache = { at: Date.now(), v: r.data.value.s };
+  return ksCache.v;
+}
+async function kioskToken2() {
+  const body = Buffer.from(JSON.stringify({ scope: 'kiosk', v: 2, exp: Date.now() + KIOSK_DAYS * DAY })).toString('base64url');
+  return `k2.${body}.${crypto.createHmac('sha256', await kioskSecret()).update(body).digest('base64url')}`;
+}
+async function isKioskAny(token) {
+  if (typeof token !== 'string') return false;
+  if (token.startsWith('k.')) return isKiosk(token);
+  if (!token.startsWith('k2.')) return false;
+  const [, body, sig] = token.split('.');
+  const good = crypto.createHmac('sha256', await kioskSecret()).update(body || '').digest('base64url');
+  if (!sig || sig.length !== good.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(good))) return false;
+  try { const { scope, exp } = JSON.parse(Buffer.from(body, 'base64url').toString()); return scope === 'kiosk' && exp > Date.now(); } catch (e) { return false; }
+}
 function isKiosk(token) {
   if (typeof token !== 'string' || !token.startsWith('k.')) return false;
   const [, body, sig] = token.split('.');
@@ -2671,7 +2698,9 @@ async function photoUrl(path) {
 }
 const maskName = (n) => { const s = String(n || ''); return s.length <= 1 ? s : s.length === 2 ? `${s[0]}○` : `${s[0]}${'○'.repeat(s.length - 2)}${s[s.length - 1]}`; };
 
-async function kioskRegister() { return [200, { token: kioskToken(), days: KIOSK_DAYS }]; }
+async function kioskRegister() { return [200, { token: await kioskToken2(), days: KIOSK_DAYS }]; }
+// 예전 열쇠를 가진 태블릿이 스스로 새 열쇠로 바꾼다 (미국 서버에서, 예전 열쇠로 확인한 뒤)
+async function kioskUpgrade() { return [200, { token: await kioskToken2(), days: KIOSK_DAYS }]; }
 
 // 번호 뒷자리 4개로 찾기. 여러 명이면 이름 가운데를 가려서 고르게 한다.
 async function checkinFind({ digits }) {
@@ -2960,9 +2989,9 @@ async function tokenOk(tk) {
   return ok;
 }
 
-const ACTIONS = { dashboard, members, member, memberAttendance, renewEngine, renewCheck, todayQueue, contactUpdate, holdStart, holdEnd, passExtend, smsTemplates, smsTemplatesSave, memberInfo, refundContext, passRefund, leadPin, salesDays, lockerBoard, kioskRegister, checkinFind, checkin, photoUpload, staffPunch, staffCall, staffAttendance, staffAttendanceSave,
+const ACTIONS = { dashboard, members, member, memberAttendance, renewEngine, renewCheck, todayQueue, contactUpdate, holdStart, holdEnd, passExtend, smsTemplates, smsTemplatesSave, memberInfo, refundContext, passRefund, leadPin, kioskUpgrade, salesDays, lockerBoard, kioskRegister, checkinFind, checkin, photoUpload, staffPunch, staffCall, staffAttendance, staffAttendanceSave,
   taskDone, taskUndo, staffList, staffAdd, staffRemove, financeGet, financeSave, salesYear, subSearch, subLink, staffUpdate, rolesSave, report, memoAdd, inquiryAdd, inquiryList, inquiryUpdate, ptBoard, revenue, msgRules, msgRulesSave, ptSession, ptAssign, ptSetLeft, notionSync, passUpdate, paymentMethod, staffOrder, roleColor, taskSnooze, reportV2, attendanceDay, pushKey, pushSubscribe, pushTest, pushWho, products, register, registerUndo, regInquiries, subLocker, reportPush };
-const KIOSK_OK = ['checkinFind', 'checkin', 'photoUpload', 'staffPunch', 'staffCall'];
+const KIOSK_OK = ['checkinFind', 'checkin', 'photoUpload', 'staffPunch', 'staffCall', 'kioskUpgrade'];
 const WRITES = ['checkin', 'photoUpload', 'taskDone', 'taskUndo', 'staffAdd', 'staffUpdate', 'staffRemove', 'financeSave', 'subLink', 'rolesSave', 'memoAdd', 'inquiryAdd', 'inquiryUpdate', 'msgRulesSave', 'ptSession', 'ptAssign', 'ptSetLeft', 'notionSync', 'passUpdate', 'paymentMethod', 'staffOrder', 'roleColor', 'taskSnooze', 'pushSubscribe', 'pushTest', 'register', 'registerUndo', 'subLocker', 'reportPush'];
 
 export default async function handler(req, res) {
@@ -3003,7 +3032,7 @@ export default async function handler(req, res) {
   const fn = ACTIONS[params.action];
   if (!fn) return res.status(400).json({ error: '알 수 없는 요청' });
   const tk = bearer(req);
-  const kiosk = KIOSK_OK.includes(params.action) && isKiosk(tk);
+  const kiosk = KIOSK_OK.includes(params.action) && await isKioskAny(tk);
   if (!kiosk && !(await tokenOk(tk))) return res.status(401).json({ error: '로그인이 필요해요' });
   try {
     const t0 = Date.now();
