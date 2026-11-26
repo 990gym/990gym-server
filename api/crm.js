@@ -717,7 +717,8 @@ async function revenue({ period = 'month' }) {
     if (sp.length > 1) { sp.forEach(([k, v]) => { methods[k].amount += Number(v) || 0; methods[k].count++; }); return; }
     const k = PAY_METHODS.includes(p.method) ? p.method : '미입력'; methods[k].amount += p.amount; methods[k].count++;
   });
-  return [200, { period, label, from, to, today, days, total, count: pays.length, groups, daily, methods, goal: period === 'today' ? Math.round(finance.target / 30) : finance.target,
+  const rf = pays.filter((p) => p.amount < 0), refund = { amount: -rf.reduce((a, p) => a + p.amount, 0), count: rf.length };
+  return [200, { period, label, from, to, today, days, total, refund, count: pays.length - rf.length, groups, daily, methods, goal: period === 'today' ? Math.round(finance.target / 30) : finance.target,
     dailyGoal: Math.round(finance.target / 30), lastPayDay: pays.reduce((a, p) => (p.day > a ? p.day : a), '') || null,
     unpaid: { count: fails.length, amount: fails.reduce((a, x) => a + (PLAN_PRICE[x.plan] || 39000), 0) },
     routes: { 토스자동결제: { amount: groups.월구독, count: pays.filter((p) => p.group === '월구독').length }, 인포결제: { amount: total - groups.월구독, count: pays.filter((p) => p.group !== '월구독').length } },
@@ -2409,6 +2410,77 @@ async function passExtend({ pass_id, days, reason, locker, staff }) {
   return member({ id: p.member_id });
 }
 
+// ---------- 환불 (원자: '결제' 한 줄(마이너스) + 이용권 상태 '환불') ----------
+// 금액은 직원이 직접 적는다. 참고 금액만 계산해서 칸에 흐리게 보여 준다:
+//   기간권 = 결제 − 쓴 일수 × (1개월 정가 ÷ 30) − 위약금 10% · 횟수권 = 결제 − 쓴 횟수 × 1회 정가 − 위약금 10%
+const REFUNDABLE = (p) => !['무효', '환불'].includes(p.status) && salesGroup(p.product_name, p.category) !== '월구독' && !/구독/.test(p.product_name || '');
+async function refundRef(p) {
+  const [pays, prods] = await Promise.all([
+    supabase.from('crm_payments').select('amount,kind').eq('pass_id', p.id),
+    supabase.from('crm_products').select('name,category,months,sessions,list_price'),
+  ]);
+  if (pays.error || prods.error) throw pays.error || prods.error;
+  const paid = (pays.data || []).filter((x) => x.kind !== '환불').reduce((a, x) => a + (x.amount || 0), 0) || p.price_paid || 0;
+  const refunded = -(pays.data || []).filter((x) => x.kind === '환불').reduce((a, x) => a + (x.amount || 0), 0);
+  const g = salesGroup(p.product_name, p.category), today = todayKST();
+  const same = (prods.data || []).filter((x) => x.list_price > 0 && salesGroup(x.name, x.category) === g);
+  const counted = p.total_count != null && p.total_count > 0;
+  let used = null, unit = null, unitLabel = null;
+  if (counted) {
+    used = Math.max(0, p.total_count - (p.remaining_count || 0));
+    const pk = same.filter((x) => x.sessions > 1 && !/체험/.test(x.name)).sort((a, b) => a.sessions - b.sessions)[0];
+    if (pk) { unit = Math.round(pk.list_price / pk.sessions); unitLabel = `1회 ${pk.name} 기준`; }
+  } else if (p.starts_on) {
+    used = p.starts_on > today ? 0 : daysBetween(p.starts_on, p.ends_on && p.ends_on < today ? p.ends_on : today) + 1;
+    const pk = same.filter((x) => x.months > 0).sort((a, b) => a.months - b.months)[0];
+    if (pk) { unit = Math.round(pk.list_price / pk.months / 30); unitLabel = `하루 ${pk.name} ÷ ${pk.months * 30}일`; }
+  }
+  const penalty = Math.round(paid * 0.1);
+  const suggest = unit != null && used != null ? Math.max(0, Math.floor((paid - refunded - used * unit - penalty) / 100) * 100) : null;
+  return { paid, refunded, counted, used, unit, unit_label: unitLabel, penalty, suggest, max: Math.max(0, paid - refunded) };
+}
+async function refundContext({ pass_id }) {
+  if (!pass_id) return [400, { error: '필수 정보 누락' }];
+  const r = await supabase.from('crm_passes').select('*').eq('id', pass_id).maybeSingle();
+  if (r.error) throw r.error;
+  if (!r.data || !REFUNDABLE(r.data)) return [400, { error: '환불할 수 있는 이용권이 아니에요 (월구독은 토스에서 해지·환불해요)' }];
+  const C = await holdContext(r.data.member_id);
+  return [200, { pass: { id: r.data.id, product_name: r.data.product_name, starts_on: r.data.starts_on, ends_on: r.data.ends_on, total_count: r.data.total_count, remaining_count: r.data.remaining_count, status: r.data.status }, ref: await refundRef(r.data), lockers: C.lockers.map((l) => ({ locker_no: l.locker_no, ends_on: l.ends_on })) }];
+}
+async function passRefund({ pass_id, amount, method, reason, staff, locker }) {
+  const n = Math.round(Number(String(amount == null ? '' : amount).replace(/[^\d]/g, '')));
+  if (!pass_id || !(n >= 0)) return [400, { error: '환불 금액을 적어주세요' }];
+  const r = await supabase.from('crm_passes').select('*').eq('id', pass_id).maybeSingle();
+  if (r.error) throw r.error;
+  const p = r.data;
+  if (!p || !REFUNDABLE(p)) return [400, { error: '환불할 수 있는 이용권이 아니에요' }];
+  const ref = await refundRef(p);
+  if (n > ref.max) return [400, { error: `결제 금액(${ref.max.toLocaleString()}원)보다 많이 환불할 수 없어요` }];
+  const who = staff ? String(staff).slice(0, 20) : null, why = reason ? String(reason).trim().slice(0, 100) : null;
+  const how = PAY_METHODS.includes(method) ? method : null, today = todayKST();
+  if (n > 0) {
+    const ins = await supabase.from('crm_payments').insert({ member_id: p.member_id, pass_id: p.id, kind: '환불', amount: -n, method: how, staff_name: who, method_note: why, paid_at: new Date().toISOString() });
+    if (ins.error) throw ins.error;
+  }
+  const keepEnd = p.ends_on && p.ends_on < today ? p.ends_on : (p.starts_on && p.starts_on > today ? p.starts_on : today);
+  const up = await supabase.from('crm_passes').update({ status: '환불', ...(p.ends_on ? { ends_on: keepEnd } : {}) }).eq('id', p.id);
+  if (up.error) throw up.error;
+  let lockNote = '';
+  if (locker) {
+    const C = await holdContext(p.member_id);
+    for (const l of C.lockers) { const u = await supabase.from('crm_locker_assignments').update({ status: '해제', ends_on: today }).eq('id', l.id); if (u.error) throw u.error; lockNote += ` · 락커 ${l.locker_no}번 비움`; }
+  }
+  if (p.status === '홀딩') { // 쉬던 이용권을 환불하면 홀딩도 오늘로 끝낸다
+    const h = await supabase.from('crm_holds').update({ ends_on: today }).eq('pass_id', p.id).or(`ends_on.is.null,ends_on.gte.${today}`); if (h.error) throw h.error;
+    const other = await supabase.from('crm_passes').select('id', { count: 'exact', head: true }).eq('member_id', p.member_id).eq('status', '홀딩');
+    if (!other.count) { const u = await supabase.from('crm_members').update({ holding: false }).eq('id', p.member_id); if (u.error) throw u.error; }
+  }
+  await syncMemberEnd(p.member_id, { allowEarlier: true });
+  await supabase.from('crm_events').insert({ member_id: p.member_id, kind: '환불', body: `${p.product_name} · ${n.toLocaleString()}원${how ? ` · ${how}` : ''}${why ? ` · ${why}` : ''}${lockNote}`, staff_name: who });
+  clearCache();
+  return member({ id: p.member_id });
+}
+
 // 고객 상태 세 갈래 — 전부 원본(이용권·문의·결제·방문·연락)에서 계산하고 저장하지 않는다
 function status3(m, today, lastContact, visitDays) {
   const expired = m.stage === '만료·이탈';
@@ -2833,7 +2905,7 @@ async function tokenOk(tk) {
   return ok;
 }
 
-const ACTIONS = { dashboard, members, member, memberAttendance, renewEngine, renewCheck, todayQueue, contactUpdate, holdStart, holdEnd, passExtend, smsTemplates, smsTemplatesSave, memberInfo, salesDays, lockerBoard, kioskRegister, checkinFind, checkin, photoUpload, staffPunch, staffCall, staffAttendance, staffAttendanceSave,
+const ACTIONS = { dashboard, members, member, memberAttendance, renewEngine, renewCheck, todayQueue, contactUpdate, holdStart, holdEnd, passExtend, smsTemplates, smsTemplatesSave, memberInfo, refundContext, passRefund, salesDays, lockerBoard, kioskRegister, checkinFind, checkin, photoUpload, staffPunch, staffCall, staffAttendance, staffAttendanceSave,
   taskDone, taskUndo, staffList, staffAdd, staffRemove, financeGet, financeSave, salesYear, subSearch, subLink, staffUpdate, rolesSave, report, memoAdd, inquiryAdd, inquiryList, inquiryUpdate, ptBoard, revenue, msgRules, msgRulesSave, ptSession, ptAssign, ptSetLeft, notionSync, passUpdate, paymentMethod, staffOrder, roleColor, taskSnooze, reportV2, attendanceDay, pushKey, pushSubscribe, pushTest, pushWho, products, register, registerUndo, regInquiries, subLocker, reportPush };
 const KIOSK_OK = ['checkinFind', 'checkin', 'photoUpload', 'staffPunch', 'staffCall'];
 const WRITES = ['checkin', 'photoUpload', 'taskDone', 'taskUndo', 'staffAdd', 'staffUpdate', 'staffRemove', 'financeSave', 'subLink', 'rolesSave', 'memoAdd', 'inquiryAdd', 'inquiryUpdate', 'msgRulesSave', 'ptSession', 'ptAssign', 'ptSetLeft', 'notionSync', 'passUpdate', 'paymentMethod', 'staffOrder', 'roleColor', 'taskSnooze', 'pushSubscribe', 'pushTest', 'register', 'registerUndo', 'subLocker', 'reportPush'];
