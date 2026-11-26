@@ -2413,7 +2413,9 @@ async function passExtend({ pass_id, days, reason, locker, staff }) {
 // ---------- 환불 (원자: '결제' 한 줄(마이너스) + 이용권 상태 '환불') ----------
 // 금액은 직원이 직접 적는다. 참고 금액만 계산해서 칸에 흐리게 보여 준다:
 //   기간권 = 결제 − 쓴 일수 × (1개월 정가 ÷ 30) − 위약금 10% · 횟수권 = 결제 − 쓴 횟수 × 1회 정가 − 위약금 10%
-const REFUNDABLE = (p) => !['무효', '환불'].includes(p.status) && salesGroup(p.product_name, p.category) !== '월구독' && !/구독/.test(p.product_name || '');
+// 월구독도 기록은 CRM에서 한다 (돈은 토스 상점관리자에서 결제 취소, 다음 결제는 홈페이지 관리자에서 해지). 기준: 결제 후 7일 이내 · 그 뒤 출석 없음 = 전액
+const isSubPass = (p) => p.category === '월구독' || /구독/.test(p.product_name || '');
+const REFUNDABLE = (p) => !['무효', '환불'].includes(p.status);
 async function refundRef(p) {
   const [pays, prods] = await Promise.all([
     supabase.from('crm_payments').select('amount,kind').eq('pass_id', p.id),
@@ -2423,6 +2425,13 @@ async function refundRef(p) {
   const paid = (pays.data || []).filter((x) => x.kind !== '환불').reduce((a, x) => a + (x.amount || 0), 0) || p.price_paid || 0;
   const refunded = -(pays.data || []).filter((x) => x.kind === '환불').reduce((a, x) => a + (x.amount || 0), 0);
   const g = salesGroup(p.product_name, p.category), today = todayKST();
+  if (isSubPass(p)) {
+    const since = p.starts_on || today, days = daysBetween(since, today);
+    const at = await supabase.from('crm_attendance').select('checked_at', { count: 'exact', head: true }).eq('member_id', p.member_id).gte('checked_at', kstStart(since));
+    if (at.error) throw at.error;
+    const visits = at.count || 0, ok = days <= 7 && visits === 0;
+    return { sub: true, paid, refunded, counted: false, used: days + 1, visits, eligible: ok, unit: null, unit_label: null, penalty: 0, suggest: ok ? Math.max(0, paid - refunded) : null, max: Math.max(0, paid - refunded) };
+  }
   const same = (prods.data || []).filter((x) => x.list_price > 0 && salesGroup(x.name, x.category) === g);
   const counted = p.total_count != null && p.total_count > 0;
   let used = null, unit = null, unitLabel = null;
