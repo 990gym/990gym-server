@@ -2909,7 +2909,7 @@ async function tokenOk(tk) {
   if (!tk) return false;
   const t = OK_TOKENS.get(tk);
   if (t && Date.now() - t < 60000) return true;
-  const ok = await verifyToken(supabase, tk);
+  const ok = await verifyToken(supabase, tk, { scopes: ['crm'] });
   if (ok) { if (OK_TOKENS.size > 200) OK_TOKENS.clear(); OK_TOKENS.set(tk, Date.now()); }
   return ok;
 }
@@ -2938,7 +2938,8 @@ export default async function handler(req, res) {
     try {
       if (!(await passwordConfigured(supabase))) return res.status(503).json({ error: '비밀번호 설정 없음' });
       if (!(await checkPassword(supabase, params.password))) { await new Promise((r) => setTimeout(r, 800)); return res.status(401).json({ error: '비밀번호가 올바르지 않습니다.' }); }
-      return res.status(200).json(await issueToken(supabase));
+      // '이 기기에서 로그인 유지': CRM 전용 30일 토큰. 비밀번호를 바꾸면 바로 풀린다
+      return res.status(200).json(await issueToken(supabase, params.remember ? { hours: 30 * 24, scope: 'crm' } : {}));
     } catch (e) { console.error('login', e); return res.status(500).json({ error: '서버 오류' }); }
   }
   if (params.action === 'cron') {

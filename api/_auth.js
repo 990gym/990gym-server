@@ -80,21 +80,23 @@ export async function checkPassword(supabase, pw) {
   return cred.kind === 'db' ? matchHash(pw, cred.hash) : sameText(pw, cred.pw);
 }
 
-export async function issueToken(supabase) {
+// scope 를 붙이면 그 화면 전용 토큰 (예: CRM '이 기기에서 로그인 유지' 30일). 관리자 화면(admin.js)은 scope 토큰을 받지 않는다.
+export async function issueToken(supabase, { hours = TOKEN_HOURS, scope } = {}) {
   const [cred, ts] = await Promise.all([credential(supabase), tokenSecret(supabase)]);
-  const exp = Date.now() + TOKEN_HOURS * 60 * 60 * 1000;
-  const body = Buffer.from(JSON.stringify({ exp })).toString('base64url');
+  const exp = Date.now() + hours * 60 * 60 * 1000;
+  const body = Buffer.from(JSON.stringify(scope ? { exp, scope } : { exp })).toString('base64url');
   return { token: `${body}.${sign(cred, ts, body)}`, expiresAt: exp };
 }
 
-export async function verifyToken(supabase, token) {
+export async function verifyToken(supabase, token, { scopes = [] } = {}) {
   if (typeof token !== 'string') return false;
   const [body, sig] = token.split('.');
   if (!body || !sig) return false;
   const [cred, ts] = await Promise.all([credential(supabase), tokenSecret(supabase)]);
   if ((!cred && !ts) || !sameText(sig, sign(cred, ts, body))) return false;
   try {
-    const { exp } = JSON.parse(Buffer.from(body, 'base64url').toString());
+    const { exp, scope } = JSON.parse(Buffer.from(body, 'base64url').toString());
+    if (scope && !scopes.includes(scope)) return false;
     return Number(exp) > Date.now();
   } catch (e) {
     return false;
