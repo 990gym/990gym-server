@@ -2417,20 +2417,33 @@ const OWNER_PIN_KEY = 'owner_pin';
 const pinHash = (pin, salt) => crypto.scryptSync(String(pin), salt, 32).toString('base64url');
 async function ownerPinRow() { const r = await supabase.from('crm_settings').select('value').eq('key', OWNER_PIN_KEY).maybeSingle(); if (r.error) throw r.error; return r.data && r.data.value; }
 function pinMatch(pin, v) { if (!v || !v.salt || !v.hash) return false; const a = Buffer.from(pinHash(pin, v.salt)), b = Buffer.from(v.hash); return a.length === b.length && crypto.timingSafeEqual(a, b); }
-async function ownerPin({ pin, next }) {
-  const v = await ownerPinRow();
+// 대표·매니저는 각자 PIN. 처음 고를 때 정하고, 그 기기는 대표 숫자가 보이는 기기가 된다. (예전 대표 PIN 'owner_pin'은 대표 PIN으로 이어 쓴다)
+const LEAD_PINS_KEY = 'lead_pins';
+async function leadInfo(name) {
+  const [st, lp] = await Promise.all([supabase.from('crm_staff').select('name,role').eq('active', true).eq('name', String(name || '')).maybeSingle(), supabase.from('crm_settings').select('value').eq('key', LEAD_PINS_KEY).maybeSingle()]);
+  if (st.error || lp.error) throw st.error || lp.error;
+  if (!st.data || !isLeadRole(st.data.role)) return null;
+  const pins = (lp.data && lp.data.value) || {};
+  let v = pins[st.data.name];
+  if (!v && /대표/.test(st.data.role)) v = await ownerPinRow();
+  return { name: st.data.name, role: st.data.role, v, pins };
+}
+async function leadPin({ name, pin, next }) {
+  const L = await leadInfo(name);
+  if (!L) return [400, { error: '대표·매니저만 PIN을 써요' }];
   const okPin = (x) => /^\d{4,8}$/.test(String(x || ''));
-  if (next !== undefined) { // 새로 정하기 (처음) 또는 바꾸기 (지금 PIN 필요)
+  if (next !== undefined) {
     if (!okPin(next)) return [400, { error: '숫자 4~8자리로 정해 주세요' }];
-    if (v && !pinMatch(pin, v)) { await new Promise((r) => setTimeout(r, 800)); return [403, { error: '지금 PIN이 맞지 않아요' }]; }
+    if (L.v && !pinMatch(pin, L.v)) { await new Promise((r) => setTimeout(r, 800)); return [403, { error: '지금 PIN이 맞지 않아요' }]; }
     const salt = crypto.randomBytes(12).toString('base64url');
-    const up = await supabase.from('crm_settings').upsert({ key: OWNER_PIN_KEY, value: { salt, hash: pinHash(next, salt), set_at: new Date().toISOString() }, updated_at: new Date().toISOString() }, { onConflict: 'key' });
+    const pins = { ...L.pins, [L.name]: { salt, hash: pinHash(next, salt), set_at: new Date().toISOString() } };
+    const up = await supabase.from('crm_settings').upsert({ key: LEAD_PINS_KEY, value: pins, updated_at: new Date().toISOString() }, { onConflict: 'key' });
     if (up.error) throw up.error;
     return [200, { ok: true }];
   }
-  if (!v) return [200, { ok: false, needs_setup: true }];
-  if (pin === undefined || pin === '') return [200, { ok: false, needs_setup: false }]; // 상태만 묻기
-  if (!pinMatch(pin, v)) { await new Promise((r) => setTimeout(r, 800)); return [403, { error: 'PIN이 맞지 않아요' }]; }
+  if (!L.v) return [200, { ok: false, needs_setup: true }];
+  if (pin === undefined || pin === '') return [200, { ok: false, needs_setup: false }];
+  if (!pinMatch(pin, L.v)) { await new Promise((r) => setTimeout(r, 800)); return [403, { error: 'PIN이 맞지 않아요' }]; }
   return [200, { ok: true }];
 }
 
@@ -2686,12 +2699,13 @@ async function vapid() {
   return v;
 }
 async function pushKey() { return [200, { key: (await vapid()).publicKey }]; }
-async function pushSubscribe({ sub, staff, device, off }) {
+async function pushSubscribe({ sub, staff, device, off, pin }) {
   const ep = sub && String(sub.endpoint || '');
   if (!/^https:\/\//.test(ep)) return [400, { error: '알림 정보가 맞지 않아요' }];
   if (off) { await supabase.from('crm_push_subs').delete().eq('endpoint', ep); return [200, { ok: true }]; }
   const k = sub.keys || {};
   if (!k.p256dh || !k.auth) return [400, { error: '알림 정보가 맞지 않아요' }];
+  if (staff) { const L = await leadInfo(staff); if (L && (!L.v || !pinMatch(pin, L.v))) return [403, { error: '대표·매니저 기기는 본인 PIN이 필요해요' }]; }
   const { error } = await supabase.from('crm_push_subs').upsert({ endpoint: ep, p256dh: k.p256dh, auth: k.auth, staff_name: staff ? String(staff).slice(0, 20) : null, device: device ? String(device).slice(0, 60) : null }, { onConflict: 'endpoint' });
   if (error) throw error;
   return [200, { ok: true }];
@@ -2707,7 +2721,7 @@ async function pushWho({ endpoint }) {
 }
 // 알림 받는 폰 구분: 폰 주인(직원 명단 이름)의 직책으로 나눈다.
 // 대표·매니저 = 모든 알림, 다른 직원 = 입실 알림·직원 호출만, 명단에서 빠진 직원 = 안 보냄. 주인을 아직 안 고른 예전 폰은 모두 받는다.
-// 센터폰(공용) = 입실 알림·직원 호출·직원 출퇴근 (매출 요약은 안 받는다)
+// 센터 공용(폰·PC, 저장 이름 '센터폰') = 입실 알림·직원 호출·직원 출퇴근 (매출 요약은 안 받는다)
 const isLeadRole = (r) => /대표|매니저|실장/.test(r || '');
 const CENTER_PHONE = '센터폰';
 async function pushPeople() {
@@ -2941,7 +2955,7 @@ async function tokenOk(tk) {
   return ok;
 }
 
-const ACTIONS = { dashboard, members, member, memberAttendance, renewEngine, renewCheck, todayQueue, contactUpdate, holdStart, holdEnd, passExtend, smsTemplates, smsTemplatesSave, memberInfo, refundContext, passRefund, ownerPin, salesDays, lockerBoard, kioskRegister, checkinFind, checkin, photoUpload, staffPunch, staffCall, staffAttendance, staffAttendanceSave,
+const ACTIONS = { dashboard, members, member, memberAttendance, renewEngine, renewCheck, todayQueue, contactUpdate, holdStart, holdEnd, passExtend, smsTemplates, smsTemplatesSave, memberInfo, refundContext, passRefund, leadPin, salesDays, lockerBoard, kioskRegister, checkinFind, checkin, photoUpload, staffPunch, staffCall, staffAttendance, staffAttendanceSave,
   taskDone, taskUndo, staffList, staffAdd, staffRemove, financeGet, financeSave, salesYear, subSearch, subLink, staffUpdate, rolesSave, report, memoAdd, inquiryAdd, inquiryList, inquiryUpdate, ptBoard, revenue, msgRules, msgRulesSave, ptSession, ptAssign, ptSetLeft, notionSync, passUpdate, paymentMethod, staffOrder, roleColor, taskSnooze, reportV2, attendanceDay, pushKey, pushSubscribe, pushTest, pushWho, products, register, registerUndo, regInquiries, subLocker, reportPush };
 const KIOSK_OK = ['checkinFind', 'checkin', 'photoUpload', 'staffPunch', 'staffCall'];
 const WRITES = ['checkin', 'photoUpload', 'taskDone', 'taskUndo', 'staffAdd', 'staffUpdate', 'staffRemove', 'financeSave', 'subLink', 'rolesSave', 'memoAdd', 'inquiryAdd', 'inquiryUpdate', 'msgRulesSave', 'ptSession', 'ptAssign', 'ptSetLeft', 'notionSync', 'passUpdate', 'paymentMethod', 'staffOrder', 'roleColor', 'taskSnooze', 'pushSubscribe', 'pushTest', 'register', 'registerUndo', 'subLocker', 'reportPush'];
