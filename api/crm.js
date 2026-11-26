@@ -3004,6 +3004,8 @@ export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
   let params = req.body || {};
   if (typeof params === 'string') { try { params = JSON.parse(params); } catch (e) { params = {}; } }
+  // 서버 깨우기 (영업시간 1분마다 DB 예약 작업이 부른다): DB 연결과 태블릿 열쇠를 미리 데워 둔다
+  if (params.action === 'ping') { try { await kioskSecret(); } catch (e) {} return res.status(200).json({ ok: true }); }
   // 브로제이 출석 가져오기: 브로제이 화면에서 바로 보내므로 로그인 대신 한 번 쓰는 가져오기 키로 확인
   if (params.action === 'brojImport') {
     try { const [code, body] = await brojImport(params); return res.status(code).json(body); } catch (e) { console.error('brojImport', e); return res.status(500).json({ error: '서버 오류' }); }
@@ -3031,7 +3033,8 @@ export default async function handler(req, res) {
   }
   const fn = ACTIONS[params.action];
   if (!fn) return res.status(400).json({ error: '알 수 없는 요청' });
-  const tk = bearer(req);
+  // 입실 태블릿은 열쇠를 본문(_k)에 담아 보낸다 → 브라우저의 사전 확인(OPTIONS) 왕복이 없어서 빠르다
+  const tk = bearer(req) || (KIOSK_OK.includes(params.action) && typeof params._k === 'string' ? params._k : null);
   const kiosk = KIOSK_OK.includes(params.action) && await isKioskAny(tk);
   if (!kiosk && !(await tokenOk(tk))) return res.status(401).json({ error: '로그인이 필요해요' });
   try {
