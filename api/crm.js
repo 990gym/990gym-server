@@ -2730,6 +2730,8 @@ async function pushPeople() {
   const leads = new Set(data.filter((x) => isLeadRole(x.role)).map((x) => x.name));
   return { active: new Set([...data.map((x) => x.name), CENTER_PHONE]), leads, punch: new Set([...leads, CENTER_PHONE]) };
 }
+// 알림은 서울 서버에서는 대답을 먼저 돌려주고 뒤에서 보낸다 (태블릿이 기다리지 않게). 미국 서버에서는 보낸 뒤 대답.
+const later = (p) => { const E = globalThis.EdgeRuntime; if (E && typeof E.waitUntil === 'function') { E.waitUntil(Promise.resolve(p).catch(() => {})); return Promise.resolve(); } return p; };
 // 알림 보내기: 등록된 폰 전부 (한 곳만 고르면 only). 2초 넘게 안 기다린다. 없어진 폰은 지운다.
 async function pushSend(msg, only) {
   try {
@@ -2780,15 +2782,16 @@ async function checkin({ id }) {
   if (error) throw error;
   if (!m) return [404, { error: '회원을 찾을 수 없어요' }];
   const d = decorate(m, today, await subsMap());
-  const [passes, recent] = await Promise.all([
+  const [passes, recent, photo] = await Promise.all([
     supabase.from('crm_passes').select('product_name,category,status,ends_on,remaining_count,total_count').eq('member_id', id).in('status', ['사용 중', '예정', '홀딩']),
     supabase.from('crm_attendance').select('checked_at').eq('member_id', id).gte('checked_at', new Date(Date.now() - 31 * DAY).toISOString()).order('checked_at', { ascending: false }),
+    photoUrl(m.photo_path),
   ]);
   if (passes.error || recent.error) throw passes.error || recent.error;
-  const base = { name: m.name, photo_url: await photoUrl(m.photo_path), needs_photo: !m.photo_path };
+  const base = { name: m.name, photo_url: photo, needs_photo: !m.photo_path };
   if (d.stage === '만료·이탈' || m.holding) {
     const reason = m.holding ? '지금 홀딩 중이에요. 인포에 말씀해 주세요.' : '이용권이 끝났어요. 인포에 말씀해 주세요.';
-    await pushSend({ title: `⚠ ${m.name}님 입실 시도 · ${hhmm()}`, body: m.holding ? '홀딩 중인 회원이에요' : `이용권이 끝난 회원이에요${m.ends_on ? `\n종료일: ${m.ends_on}` : ''}`, tag: `att-${Date.now()}` });
+    await later(pushSend({ title: `⚠ ${m.name}님 입실 시도 · ${hhmm()}`, body: m.holding ? '홀딩 중인 회원이에요' : `이용권이 끝난 회원이에요${m.ends_on ? `\n종료일: ${m.ends_on}` : ''}`, tag: `att-${Date.now()}` }));
     return [200, { ...base, blocked: true, reason }];
   }
 
@@ -2816,9 +2819,11 @@ async function checkin({ id }) {
     gap_days: m.last_attended_on && m.last_attended_on < today ? daysBetween(m.last_attended_on, today) : null,
     visits: (m.total_visits || 0) + (again || dup ? 0 : 1) };
   if (!dup) {
-    // 오늘 입실한 회원 수 (하루 한 명은 한 번만)
-    const dc = await supabase.from('crm_members').select('id', { count: 'exact', head: true }).eq('last_attended_on', today);
-    await pushSend(checkinMessage(m.name, { ...out, day_total: dc.error ? null : dc.count })); // 직원 폰으로 (10분 안에 또 찍은 건 안 보냄)
+    // 오늘 입실한 회원 수 (하루 한 명은 한 번만) + 직원 폰 알림 — 서울 서버에서는 태블릿에 먼저 대답하고 뒤에서
+    await later((async () => {
+      const dc = await supabase.from('crm_members').select('id', { count: 'exact', head: true }).eq('last_attended_on', today);
+      await pushSend(checkinMessage(m.name, { ...out, day_total: dc.error ? null : dc.count })); // 10분 안에 또 찍은 건 안 보냄
+    })());
   }
   return [200, out];
 }
@@ -2865,7 +2870,7 @@ async function staffPunch({ phone }) {
     kind = '출근';
   }
   const worked = list.reduce((a, r) => a + minsOf(r), 0);
-  if (!dup) await pushToLeads({ title: `${s.name}님 ${kind} · ${kstHM(at)}`, body: kind === '퇴근' ? `오늘 총 ${minsTxt(worked)}` : (s.role || '직원'), tag: `work-${now}` });
+  if (!dup) await later(pushToLeads({ title: `${s.name}님 ${kind} · ${kstHM(at)}`, body: kind === '퇴근' ? `오늘 총 ${minsTxt(worked)}` : (s.role || '직원'), tag: `work-${now}` }));
   return [200, { name: s.name, role: s.role || null, kind, at, dup, worked_min: worked }];
 }
 // 입실 태블릿 '직원 호출' → 직원 폰 전체로 알림. 20초 안에 또 누른 건 한 번으로 친다.
@@ -2875,7 +2880,7 @@ async function staffCall() {
   if (Date.now() - last < 20000) return [200, { ok: true, again: true }];
   const at = new Date().toISOString();
   await supabase.from('crm_settings').upsert({ key: 'staff_call', value: { at }, updated_at: at }, { onConflict: 'key' });
-  await pushSend({ title: `🔔 직원 호출 · ${kstHM(at)}`, body: '입실 태블릿에서 직원을 찾고 있어요', tag: `call-${Date.now()}`, call: true });
+  await later(pushSend({ title: `🔔 직원 호출 · ${kstHM(at)}`, body: '입실 태블릿에서 직원을 찾고 있어요', tag: `call-${Date.now()}`, call: true }));
   return [200, { ok: true, again: false }];
 }
 // 출근부: 한 달 치 기록 + 직원별 근무시간. 퇴근 안 찍은 지난 날 = missing (근무시간에 안 넣음)
